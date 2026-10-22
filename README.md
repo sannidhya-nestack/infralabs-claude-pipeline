@@ -2,7 +2,7 @@
 
 GitHub Actions orchestration for InfraLabs IQ invoice OCR with the Claude Code CLI. This repo is public and holds
 only workflows and two small bash scripts. The InfraLabs code and the prompt live in the private repo
-`nestacktechnologies/InfralabsIQ`, which every run checks out into `app/`.
+`<org>/<private InfralabsIQ repo>`, which every run checks out into `app/`.
 
 ## Quick start (Hinglish)
 
@@ -10,6 +10,7 @@ Ye repo sirf orchestration hai: har uploaded PDF ke liye ek GitHub Actions run, 
 checkout karke `aws/run-one.ts` chalata hai. OCR Claude CLI karta hai (Mistral ki jagah), baaki pipeline wahi hai.
 
 1. GitHub pe naya **public** repo banao, ye code `main` pe push karo (workflow files default branch pe hone chahiye).
+   Push se pehle neeche "Before the first push" checklist dekho.
 2. `claude setup-token` chalao (browser login, token 1 saal chalta hai, kahin save nahi hota), phir
    `gh secret set CLAUDE_CODE_OAUTH_TOKEN -R <owner>/infralabs-claude-pipeline` mein paste karo.
 3. Baaki secrets aur vars neeche ke tables se set karo. `INFRALABS_REF` mein commit SHA ya tag do, branch nahi.
@@ -43,7 +44,7 @@ POST /api/invoices, or Reprocess
                                                11 always(): a stopped run -> failed
                                                12 result: 0 and 75 green, 3 and 1 red
 
-parent.yml, every 30 min: scripts/sweep.sh
+parent.yml, every 30 min: scripts/sweep.sh (up to 20 dispatches a sweep, in the platform's lane)
   lost or failed dispatches, ended deferrals ----> gh workflow run process-invoice.yml
 
 Data: RDS MySQL (job rows), S3 (the raw PDF, pages read so far in <raw>.claude.json), Anthropic (claude -p)
@@ -62,6 +63,17 @@ The job row carries the state, in `ProcessingJob.errorMessage` (never shown in t
 | `runner crash: <error>` | run-one crashed. Only in the private database, never in the public log. |
 
 `ProcessingJob.bullJobId` holds `gh:<run id>/<attempt>` of the run that claimed the job; the cleanup step keys on it.
+
+## Before the first push
+
+- **Pinned actions.** `git ls-remote https://github.com/actions/checkout refs/tags/v4.4.0`, and the same for
+  `actions/setup-node`, must print the SHAs pinned in both workflows (for an annotated tag, the peeled `^{}` line).
+- **`concurrency.queue: max`** in process-invoice.yml could not be checked offline. Dispatch one test run right after
+  the push: if the Actions tab flags the file as an invalid workflow, or the dispatch is rejected for it, remove that one
+  line and rely on the parent sweep (a lane then keeps one run waiting, a newer dispatch cancels it, and the sweep sends
+  the cancelled one again).
+- **Commit author.** `git log --format='%an <%ae> | %cn <%ce>'` must show only a `users.noreply.github.com` address: a
+  public repo publishes the email of every author and committer.
 
 ## Setup
 
@@ -93,7 +105,7 @@ Set each with `gh secret set <NAME> -R "$REPO"`.
 | `DATABASE_URL` | yes | The platform's `mysql://` URL (special characters percent-encoded, as the platform has it). |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | yes | S3 access to the raw invoice prefix. |
 | `AWS_S3_BUCKET` | yes | The bucket name. A secret, because step env blocks print variables in clear text. |
-| `INFRALABS_REPOSITORY` | yes | `nestacktechnologies/InfralabsIQ` (a secret for the same reason). |
+| `INFRALABS_REPOSITORY` | yes | `<org>/<private InfralabsIQ repo>` (a secret for the same reason). |
 | `INFRALABS_REF` | yes | Commit SHA or tag of InfralabsIQ to run. Not a branch: a push must not change what runs mid-queue. |
 | `INFRALABS_REPO_TOKEN` | yes | Fine-grained token, only that repo, Contents: Read-only. |
 | `GOOGLE_GMAIL_CLIENT_ID`, `GOOGLE_GMAIL_CLIENT_SECRET`, `GMAIL_TOKEN_ENCRYPTION_KEY` | for team mail | Same values as the platform, or the stored Gmail token cannot be decrypted. |
@@ -115,8 +127,8 @@ Set each with `gh variable set <NAME> -R "$REPO" --body <value>`.
 
 ### 5. Tokens
 
-- `INFRALABS_REPO_TOKEN`: fine-grained personal access token, resource owner `nestacktechnologies`, only the
-  `InfralabsIQ` repository, repository permission Contents: Read-only. The organization must allow fine-grained tokens
+- `INFRALABS_REPO_TOKEN`: fine-grained personal access token, resource owner `<org>`, only that repository (the one
+  in `INFRALABS_REPOSITORY`), repository permission Contents: Read-only. The organization must allow fine-grained tokens
   and may have to approve it. A read-only deploy key (`ssh-key:` on the checkout step) is the alternative that does not
   expire.
 - `INVOICE_GITHUB_TOKEN` (on the platform, not here): fine-grained token, only this repository, repository permission
@@ -147,6 +159,9 @@ then dispatches; a failed dispatch is logged and marked `gh-dispatched:0`, and t
    gh run watch -R "$REPO"
    ```
 
+   A hand dispatch needs a `PENDING` ProcessingJob row with kind `github-actions` (the platform writes it; for a manual
+   test, upload a QA bill through the platform with `INVOICE_GITHUB_REPO` set, or reset the row).
+
 2. The run is named `invoice <upload id>`. Its summary shows the status, pages, calls, re-reads and minutes. The
    invoice then shows up in the platform for review.
 3. A run for an upload in any other state ends green at "Nothing to do: <state>" without touching it.
@@ -160,8 +175,8 @@ From `aws/run-one.ts` (step "Process invoice"), turned into the run's colour by 
 |---|---|---|---|
 | 0 | Done, or nothing to claim (already taken, done, deferred, gone). | green | Nothing. |
 | 75 | Deferred: Claude usage limit, the time budget, or pages to retry. | green | Job back to `PENDING` with `claude-deferred:<t>`; the sweep dispatches it after `<t>` and the new run resumes from the saved pages. |
-| 3 | Configuration: Claude login or billing, model, CLI version, or a secret not set. | red | Fix the config. A missing secret stops the run before the claim, so the upload waits and the sweep retries it. A Claude login, model or version error fails the upload with the real message: Reprocess it after the fix. |
-| 1 | run-one crashed, or the CLI preflight failed. | red | A crash leaves `runner crash: ...` on the job, and the cleanup step marks the upload failed: Reprocess resumes from the saved pages. A preflight failure leaves the job untouched, and the sweep retries it. |
+| 3 | Configuration: the Claude token (login or billing), the model, an installed but too-old CLI, or a secret not set. | red | Fix the config. A missing secret stops the run before the claim, so the upload waits and the sweep retries it. A token, model or too-old CLI error fails the upload with the real message: Reprocess it after the fix. |
+| 1 | run-one crashed, the CLI preflight failed, or the job was no longer this run's to hand back (`release-failed`). | red | A crash leaves `runner crash: ...` on the job, and the cleanup step marks the upload failed: Reprocess resumes from the saved pages. A preflight failure leaves the job untouched, and the sweep retries it. A `release-failed` run has nothing left to do: whoever took the job over (a Reprocess, the watchdog, a delete) owns it now. |
 
 Cancelling a run (or the 350 min cap) signals run-one, which hands the job back like a deferral; whatever it could not
 hand back, the cleanup step marks failed with "Runner stopped (time cap or crash): reprocess to resume from the saved
@@ -171,7 +186,7 @@ pages". To stop an invoice for good, fail or delete it in the platform.
 
 | Symptom | Cause and fix |
 |---|---|
-| `Nothing to do: not-pending` | The job is not `PENDING` `github-actions`: already processed, claimed by another run, or the upload was processed before GitHub mode. Reprocess it on the platform. |
+| `Nothing to do: not-pending` | The job is not `PENDING` `github-actions`, or there is no job row: already processed, claimed by another run, or the upload was processed before GitHub mode. Reprocess it on the platform. |
 | `Nothing to do: deferred` | Waiting for the Claude reset time; the sweep dispatches it when due. |
 | `Nothing to do: not-in-flight` or `missing` | The upload is no longer processing, or was deleted. |
 | `db query failed (exit 1, mysql ERROR 1045)` | Wrong user or password in `DATABASE_URL`. Copy the platform's URL as is. |
@@ -180,7 +195,8 @@ pages". To stop an invoice for good, fail or delete it in the platform.
 | `mysql ERROR 1044` or `1142` | The database user lacks a privilege. |
 | `DATABASE_URL is not set or not a mysql:// URL` | The secret is missing or malformed. |
 | "Check out InfralabsIQ" fails | `INFRALABS_REPO_TOKEN` expired or lacks Contents: Read on the repo, the organization has not approved it, or `INFRALABS_REF` does not exist. |
-| Every run ends red with exit 3 | The setup token expired (1 year) or was revoked, or `CLAUDE_OCR_MODEL` / `CLAUDE_CLI_VERSION` is wrong. Run `claude setup-token` again and update the secret, then Reprocess the failed uploads. |
+| Every run ends red with exit 3 | The setup token expired (1 year) or was revoked, `CLAUDE_OCR_MODEL` is wrong, or `CLAUDE_CLI_VERSION` installs a CLI that is too old (below 2.1.293). Fix it (for the token: `claude setup-token` again and update the secret), then Reprocess the failed uploads. |
+| "Install Claude Code CLI" fails | `CLAUDE_CLI_VERSION` is malformed or not on npm. The upload waits (its job stays `PENDING`) and the sweep retries it: fix the variable. |
 | Many runs stay queued | Each lane runs one bill at a time (and holds up to 100 waiting). Raise `LANES` and `INVOICE_GITHUB_LANES` together, keeping the shared Claude usage in mind. |
 | The parent sweep stopped running | 60 days without repository activity disables cron in a public repo. Actions > Parent sweep > Enable workflow, or push a commit. |
 | An upload failed with "Runner stopped (time cap or crash)" | The bill did not finish in 350 min, or run-one crashed. Reprocess resumes from the saved pages. |
@@ -189,7 +205,9 @@ pages". To stop an invoice for good, fail or delete it in the platform.
 ## Security notes
 
 - **Logs are public.** Any signed-in GitHub user can read the run logs and summaries of a public repo. The workflows
-  print only counts, statuses and the opaque upload id. run-one writes its own log (file names, services, amounts) to
+  print only counts, statuses, the opaque upload id and setup output: the subject line of the InfralabsIQ commit at
+  `INFRALABS_REF` (actions/checkout prints it), npm and apt output, and the last 30 lines of a failed `npm ci`. Keep
+  the subject of that commit free of customer data. run-one writes its own log (file names, services, amounts) to
   `$RUNNER_TEMP/run.log`, which is never printed or uploaded, and there are no artifacts. Keep it that way: no
   `cat run.log`, no `upload-artifact`, no `set -x`.
 - **Triggers.** Only `workflow_dispatch` and `schedule`. Never add `pull_request` or `pull_request_target`: a pull
@@ -211,10 +229,12 @@ pages". To stop an invoice for good, fail or delete it in the platform.
   GRANT SELECT, INSERT, UPDATE, DELETE ON `<database>`.* TO 'gh_pipeline'@'%';
   ```
 
-  `db.sh` connects with `ssl-mode=REQUIRED`: encrypted, but the server certificate is not verified. To verify it, add
-  `ssl-ca` (the RDS global bundle) and `ssl-mode=VERIFY_IDENTITY` to `db.sh`, and the matching Prisma TLS options to
-  `DATABASE_URL`. Better still, later: a self-hosted runner inside the VPC, or a platform callback API, so no runner
-  holds database credentials.
+  With `REQUIRE SSL`, the Prisma URL in `DATABASE_URL` must ask for TLS too, or run-one is refused: add the parameter
+  `sslaccept=accept_invalid_certs` for TLS without a CA check, or `sslcert=<path to the RDS CA bundle>` with
+  `sslaccept=strict` to verify the server (the file has to be on the runner). `mysql` in `db.sh` already uses
+  `ssl-mode=REQUIRED` and ignores the URL's parameters: encrypted, but the server certificate is not verified. To
+  verify it there too, add `ssl-ca` (the RDS global bundle) and `ssl-mode=VERIFY_IDENTITY` to `db.sh`. Better still,
+  later: a self-hosted runner inside the VPC, or a platform callback API, so no runner holds database credentials.
 - **AWS.** Static keys for now: scope the IAM user to the raw invoice prefix of the bucket (GetObject, PutObject,
   DeleteObject). Later, GitHub OIDC (`id-token: write`) with a role that trusts only this repo's default branch
   removes the keys altogether.
@@ -261,5 +281,6 @@ Accuracy is measured in the private repo, not here: `aws/ocr-bench.ts` in Infral
 saved bills, offline (no database, S3, Mistral or OpenAI calls). Per bill and engine it reports money recall and
 precision against the PDF text layer, the reconciliation delta, records to check, and the workbook truth for the
 reference bill, in `bench-out/report.md` and `report.json`. Run it on the runner's CLI version:
-`npm i --prefix <dir> @anthropic-ai/claude-code@2.1.295` and `CLAUDE_BIN=<dir>/node_modules/.bin/claude`. Details in
+`npm i --prefix <dir> @anthropic-ai/claude-code@2.1.295` and `CLAUDE_BIN=<dir>/node_modules/.bin/claude` (on Windows,
+point `CLAUDE_BIN` at the `claude.exe` the package installs, never the `.cmd` shim). Details in
 `docs/claude-pipeline.md` there.
