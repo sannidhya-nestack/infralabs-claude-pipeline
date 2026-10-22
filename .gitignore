@@ -1,0 +1,5 @@
+# The private InfralabsIQ checkout lands here on the runner.
+app/
+*.log
+.env*
+my.cnf

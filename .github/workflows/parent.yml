@@ -1,0 +1,43 @@
+name: Parent sweep
+
+# The safety net behind the platform's own dispatch: re-dispatches PENDING
+# github-actions jobs whose dispatch was lost or failed, and Claude deferrals
+# whose reset time has passed. See scripts/sweep.sh.
+on:
+  schedule:
+    # Every 30 min, off the top of the hour: GitHub delays and drops scheduled
+    # runs most at :00.
+    - cron: "7,37 * * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: parent-sweep
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  sweep:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out pipeline scripts
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Sweep and dispatch
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          # A schedule event has no repository payload, and always runs on the default branch.
+          REF: ${{ github.event.repository.default_branch || github.ref_name }}
+          LANES: ${{ vars.LANES || '2' }}
+        run: bash scripts/sweep.sh

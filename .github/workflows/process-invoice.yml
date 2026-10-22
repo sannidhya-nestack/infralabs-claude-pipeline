@@ -1,0 +1,245 @@
+name: Process invoice
+run-name: invoice ${{ inputs.upload_id }}
+
+# One run = one uploaded PDF. The platform dispatches it, and parent.yml
+# re-dispatches what got lost or deferred. The runner checks out the private
+# InfralabsIQ repo into app/ and runs aws/run-one.ts there: it claims the job,
+# reads the kept pages with the Claude CLI and finishes the invoice the way the
+# Fargate worker does. Logs are public: only counts and statuses are printed.
+on:
+  workflow_dispatch:
+    inputs:
+      upload_id:
+        description: Upload id from the platform (Upload.id)
+        required: true
+        type: string
+      lane:
+        description: Concurrency lane, from 0 to LANES minus 1
+        required: false
+        default: "0"
+        type: string
+
+permissions:
+  contents: read
+
+# One bill at a time per lane. queue: max keeps up to 100 runs waiting; without
+# it a new dispatch would replace the one already pending.
+concurrency:
+  group: claude-lane-${{ inputs.lane }}
+  cancel-in-progress: false
+  queue: max
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  process:
+    runs-on: ubuntu-24.04
+    # Under the 6 h hosted job cap, so the cleanup step still runs at the time cap.
+    timeout-minutes: 350
+    steps:
+      - name: Validate inputs
+        env:
+          UPLOAD_ID_INPUT: ${{ inputs.upload_id }}
+          LANE_INPUT: ${{ inputs.lane }}
+        run: |
+          echo "JOB_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
+          [[ "$UPLOAD_ID_INPUT" =~ ^[a-z0-9]{20,40}$ ]] || { echo "::error::upload_id is not a platform upload id"; exit 1; }
+          [[ "$LANE_INPUT" =~ ^[0-9]{1,2}$ ]] || { echo "::error::lane must be a number from 0 to 99"; exit 1; }
+          echo "UPLOAD_ID=$UPLOAD_ID_INPUT" >> "$GITHUB_ENV"
+
+      - name: Check out pipeline scripts
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      # Before npm ci: a queued duplicate, a job that is already done or a
+      # deferral still in the future ends the run here, green.
+      - name: Runnable?
+        id: check
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          source scripts/db.sh
+          valid_id "$UPLOAD_ID"
+          state=$(db_query "SELECT IFNULL((SELECT CASE
+              WHEN u.status <> 'processing' THEN 'not-in-flight'
+              WHEN j.status IS NULL OR j.status <> 'PENDING' OR j.kind <> 'github-actions' THEN 'not-pending'
+              WHEN j.errorMessage LIKE 'claude-deferred:%'
+                AND CAST(SUBSTRING(j.errorMessage, 17) AS UNSIGNED) > UNIX_TIMESTAMP() THEN 'deferred'
+              ELSE 'runnable' END
+            FROM Upload u LEFT JOIN ProcessingJob j ON j.uploadId = u.id
+            WHERE u.id = '$UPLOAD_ID'), 'missing')")
+          if [ "$state" = runnable ]; then
+            echo "runnable=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "runnable=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Nothing to do: $state"
+            echo "Nothing to do: $state" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Check out InfralabsIQ
+        if: steps.check.outputs.runnable == 'true'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ secrets.INFRALABS_REPOSITORY }}
+          ref: ${{ secrets.INFRALABS_REF }}
+          token: ${{ secrets.INFRALABS_REPO_TOKEN }}
+          persist-credentials: false
+          path: app
+
+      # Caches the npm download cache only, never node_modules (it holds the
+      # generated Prisma client of the private schema).
+      - name: Set up Node
+        if: steps.check.outputs.runnable == 'true'
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install dependencies
+        if: steps.check.outputs.runnable == 'true'
+        working-directory: app
+        run: npm ci --no-audit --no-fund > "$RUNNER_TEMP/npm-ci.log" 2>&1 || { tail -n 30 "$RUNNER_TEMP/npm-ci.log"; exit 1; }
+
+      # pdfjs crashes inside canvas without fonts (same as the worker image).
+      - name: Install fonts
+        if: steps.check.outputs.runnable == 'true'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends fonts-dejavu-core fontconfig
+
+      - name: Install Claude Code CLI
+        if: steps.check.outputs.runnable == 'true'
+        env:
+          CLAUDE_CLI_VERSION: ${{ vars.CLAUDE_CLI_VERSION }}
+        run: |
+          version="${CLAUDE_CLI_VERSION:-2.1.295}"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::CLAUDE_CLI_VERSION must be an exact version such as 2.1.295"; exit 1; }
+          npm install -g --no-audit --no-fund "@anthropic-ai/claude-code@$version"
+          claude --version
+
+      - name: Process invoice
+        id: run
+        if: steps.check.outputs.runnable == 'true'
+        working-directory: app
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ vars.AWS_REGION || 'ap-southeast-2' }}
+          AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
+          AWS_S3_RAW_INVOICES_FOLDER: ${{ vars.AWS_S3_RAW_INVOICES_FOLDER || 'raw-pdf' }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GOOGLE_GMAIL_CLIENT_ID: ${{ secrets.GOOGLE_GMAIL_CLIENT_ID }}
+          GOOGLE_GMAIL_CLIENT_SECRET: ${{ secrets.GOOGLE_GMAIL_CLIENT_SECRET }}
+          GMAIL_TOKEN_ENCRYPTION_KEY: ${{ secrets.GMAIL_TOKEN_ENCRYPTION_KEY }}
+          NEXT_PUBLIC_APP_URL: ${{ vars.APP_URL }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          LLM_GENERIC_PARSER_ENABLED: ${{ secrets.OPENAI_API_KEY == '' && 'false' || '' }}
+          OCR_PROVIDER: claude
+          MISTRAL_OCR_ENABLED: "false"
+          RECOVERY_PROVIDER: claude
+          SERVICE_SUMMARY_AI_RECOVERY: ${{ vars.CLAUDE_AI_RECOVERY || 'true' }}
+          AWS_TEXTRACT_HEAVY_BILL_ROWS: "100000"
+          NODE_OPTIONS: --max-old-space-size=12288
+          RUN_RESULT_FILE: ${{ runner.temp }}/result.json
+          CLAUDE_OCR_MODEL: ${{ vars.CLAUDE_OCR_MODEL || 'claude-sonnet-5-5' }}
+        run: |
+          # A secret that is not set arrives as "". Unset those, so an empty
+          # ANTHROPIC_API_KEY cannot shadow the OAuth token.
+          for name in CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY OPENAI_API_KEY LLM_GENERIC_PARSER_ENABLED; do
+            [ -n "${!name:-}" ] || unset "$name"
+          done
+          # Missing config must not fail a customer's upload: stop before run-one claims it.
+          missing=""
+          for name in DATABASE_URL AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_S3_BUCKET; do
+            [ -n "${!name:-}" ] || missing="$missing $name"
+          done
+          [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}${ANTHROPIC_API_KEY:-}" ] || missing="$missing CLAUDE_CODE_OAUTH_TOKEN"
+          if [ -n "$missing" ]; then
+            echo "::error::Secrets not set:$missing"
+            echo "code=3" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # The log names files, services and amounts, so it stays on the runner.
+          # node --import tsx, not npx tsx: one process, so the signal below reaches
+          # run-one itself (the tsx CLI relays it and SIGKILLs a child that is busy).
+          node --import tsx aws/run-one.ts "$UPLOAD_ID" > "$RUNNER_TEMP/run.log" 2>&1 &
+          pid=$!
+          # On cancel or at the time cap the runner signals only this shell. Pass it
+          # on, so run-one hands the job back (exit 75) instead of dying mid-write.
+          trap 'kill -TERM "$pid" 2>/dev/null || true' INT TERM
+          code=0
+          wait "$pid" || code=$?
+          while kill -0 "$pid" 2>/dev/null; do code=0; wait "$pid" || code=$?; done
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "run-one exit code $code"
+
+      - name: Summary
+        if: always() && steps.check.outputs.runnable == 'true'
+        env:
+          RESULT_FILE: ${{ runner.temp }}/result.json
+          CODE: ${{ steps.run.outputs.code }}
+        run: |
+          # Aggregates only: anything that is not a number or a short plain token prints as "-".
+          {
+            echo "### run-one exit code: ${CODE:-none}"
+            if [ -s "$RESULT_FILE" ]; then
+              echo "| Status | Upload | Pages | Calls | Re-reads | Unresolved | Failed | Minutes | Model |"
+              echo "|---|---|---|---|---|---|---|---|---|"
+              jq -r 'def safe: if type == "number" then (. * 10 | round / 10 | tostring)
+                  elif type == "array" then (length | tostring)
+                  elif type == "string" and test("^[A-Za-z0-9._:/\\[\\]-]{1,64}$") then .
+                  else "-" end;
+                "| \(.status | safe) | \(.uploadStatus | safe) | \(.pages | safe) | \(.calls | safe) | \(.rereads | safe) | \(.unresolved | safe) | \(.failed | safe) | \(.minutes | safe) | \(.model | safe) |"' \
+                "$RESULT_FILE" || echo "The result file is not valid JSON."
+            else
+              echo "No result file."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # The time cap or a crash leaves the job PROCESSING under this run's tag:
+      # mark it failed, so reviewers see it and Reprocess resumes from the pages
+      # saved in S3. A no-op when run-one finished or deferred the job itself.
+      - name: Clean up a stopped run
+        if: always() && steps.check.outputs.runnable == 'true'
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          source scripts/db.sh
+          valid_id "$UPLOAD_ID"
+          tag="gh:$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT"
+          msg="IF(j.errorMessage LIKE 'runner crash:%', j.errorMessage, 'Runner stopped (time cap or crash): reprocess to resume from the saved pages')"
+          # UTC_TIMESTAMP, not NOW: Prisma stores UTC whatever the server time zone.
+          # The upload goes first (its where needs the job still PROCESSING), and
+          # only while in flight, so a finished extraction is never overwritten.
+          changed=$(db_query "START TRANSACTION;
+            UPDATE Upload u JOIN ProcessingJob j ON j.uploadId = u.id
+              SET u.status = 'failed', u.errorMessage = $msg, u.updatedAt = UTC_TIMESTAMP(3)
+              WHERE u.id = '$UPLOAD_ID' AND u.status IN ('processing', 'uploading')
+                AND j.status = 'PROCESSING' AND j.bullJobId = '$tag';
+            UPDATE ProcessingJob j
+              SET j.status = 'FAILED', j.errorMessage = $msg, j.finishedAt = UTC_TIMESTAMP(3), j.updatedAt = UTC_TIMESTAMP(3)
+              WHERE j.uploadId = '$UPLOAD_ID' AND j.status = 'PROCESSING' AND j.bullJobId = '$tag';
+            SELECT ROW_COUNT();
+            COMMIT;")
+          if [ "$changed" = 1 ]; then
+            echo "::warning::The run stopped while the job was still running: marked it failed."
+          else
+            echo "Nothing to clean up."
+          fi
+
+      - name: Result
+        if: steps.check.outputs.runnable == 'true'
+        env:
+          CODE: ${{ steps.run.outputs.code }}
+        run: |
+          case "$CODE" in
+            0) echo "Done." ;;
+            75) echo "::notice::Deferred (Claude usage limit, time budget or pages to retry): the parent sweep dispatches it again when it is due." ;;
+            3) echo "::error::Configuration error: a secret is missing, or the Claude login, model or CLI version is wrong."; exit 3 ;;
+            *) echo "::error::run-one failed (exit ${CODE:-none}): the reason is on the job row in the platform database."; exit 1 ;;
+          esac
