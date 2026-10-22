@@ -142,6 +142,8 @@ jobs:
           MISTRAL_OCR_ENABLED: "false"
           RECOVERY_PROVIDER: claude
           SERVICE_SUMMARY_AI_RECOVERY: ${{ vars.CLAUDE_AI_RECOVERY || 'true' }}
+          # "true" while testing: the runner sends no processed-document email.
+          DISABLE_TEAM_NOTIFICATIONS: ${{ vars.DISABLE_TEAM_NOTIFICATIONS }}
           AWS_TEXTRACT_HEAVY_BILL_ROWS: "100000"
           NODE_OPTIONS: --max-old-space-size=12288
           RUN_RESULT_FILE: ${{ runner.temp }}/result.json
