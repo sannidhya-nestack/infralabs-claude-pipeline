@@ -1,0 +1,23 @@
+{
+  "sandbox": {
+    "enabled": true,
+    "failIfUnavailable": true,
+    "allowUnsandboxedCommands": false,
+    "autoAllowBashIfSandboxed": true,
+    "network": {
+      "allowedDomains": [],
+      "strictAllowlist": true
+    },
+    "credentials": {
+      "envVars": [
+        { "name": "CLAUDE_CODE_OAUTH_TOKEN", "mode": "deny" },
+        { "name": "ANTHROPIC_API_KEY", "mode": "deny" }
+      ]
+    }
+  },
+  "permissions": {
+    "defaultMode": "dontAsk",
+    "blockReadsOutsideWorkingDirectories": true
+  },
+  "disableAllHooks": true
+}

@@ -1,0 +1,180 @@
+name: Agent
+run-name: agent ${{ inputs.upload_id }} ${{ inputs.host_run }}
+
+# The agent for one digital bill, dispatched by a process-invoice.yml run on
+# this branch (the host run). It writes and runs a program that turns the
+# bill's kept pages into the transcription contract; the host's own checks
+# accept or refuse every page. This VM holds no secret but AGENT_CLAUDE_TOKEN,
+# and that only in the Agent step: no database, AWS, OpenAI, Gmail or private
+# repo credential is here. The bill arrives sealed to a key made in this run,
+# the agent runs as its own user inside an OS jail and the Claude Code sandbox,
+# and its result goes back sealed to the host run's key. Logs and the summary
+# carry counts only.
+on:
+  workflow_dispatch:
+    inputs:
+      upload_id:
+        description: Upload id from the platform (Upload.id)
+        required: true
+        type: string
+      host_run:
+        description: Run id of the process-invoice run that holds the bill
+        required: true
+        type: string
+      host_key:
+        description: That run's X25519 public key (raw, base64)
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: agent-${{ inputs.upload_id }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  agent:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 80
+    steps:
+      - name: Validate inputs
+        env:
+          UPLOAD_ID_INPUT: ${{ inputs.upload_id }}
+          HOST_RUN_INPUT: ${{ inputs.host_run }}
+          HOST_KEY_INPUT: ${{ inputs.host_key }}
+        run: |
+          [[ "$UPLOAD_ID_INPUT" =~ ^[a-z0-9]{20,40}$ ]] || { echo "::error::upload_id is not a platform upload id"; exit 1; }
+          [[ "$HOST_RUN_INPUT" =~ ^[0-9]{1,20}$ ]] || { echo "::error::host_run is not a run id"; exit 1; }
+          [[ "$HOST_KEY_INPUT" =~ ^[A-Za-z0-9+/]{43}=$ ]] || { echo "::error::host_key is not a raw X25519 public key in base64"; exit 1; }
+          { echo "HOST_RUN=$HOST_RUN_INPUT"; echo "HOST_KEY=$HOST_KEY_INPUT"; } >> "$GITHUB_ENV"
+
+      # This repo only: no InfralabsIQ code and no INFRALABS_* secret.
+      - name: Check out pipeline scripts
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      # Key first, with the image's own node, so the host seals the bill while
+      # the rest installs.
+      - name: Key
+        run: |
+          umask 077
+          mkdir "$RUNNER_TEMP/key"
+          node scripts/seal.mjs keygen "$RUNNER_TEMP/key" > "$RUNNER_TEMP/key/key.pub"
+
+      - name: Upload agent-key
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: agent-key
+          path: ${{ runner.temp }}/key/key.pub
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+
+      # sandbox-runtime brings the sandbox's seccomp filter, which blocks Unix
+      # sockets, and srt, which the jail's self-test runs a sandboxed command
+      # through (srt needs ripgrep).
+      - name: Install
+        env:
+          CLAUDE_CLI_VERSION: ${{ vars.CLAUDE_CLI_VERSION }}
+        run: |
+          version="${CLAUDE_CLI_VERSION:-2.1.295}"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::CLAUDE_CLI_VERSION must be an exact version such as 2.1.295"; exit 1; }
+          sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends bubblewrap socat poppler-utils acl ripgrep
+          npm install -g --no-audit --no-fund "@anthropic-ai/claude-code@$version" @anthropic-ai/sandbox-runtime@0.0.79
+          claude --version
+
+      # Any failure ends the job here: no agent runs, and the host reads the bill with vision.
+      - name: Jail
+        run: |
+          node scripts/check-session.mjs --selftest
+          sudo bash scripts/agent-jail.sh "$HOME" "$$" "$(dirname "$(command -v srt)")"
+
+      # The only step with the GitHub token: the bill, from the host run.
+      - name: Input
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          umask 077
+          bash scripts/wait-artifact.sh "$HOST_RUN" agent-input 20 "$RUNNER_TEMP/input" 283115520
+          node scripts/seal.mjs open "$RUNNER_TEMP/key/key.pem" "$RUNNER_TEMP/input/bundle.sealed" "$RUNNER_TEMP/bundle.tar"
+          mkdir "$RUNNER_TEMP/bundle"
+          tar -xf "$RUNNER_TEMP/bundle.tar" -C "$RUNNER_TEMP/bundle" --no-same-owner --no-same-permissions
+          sudo cp -R "$RUNNER_TEMP/bundle/pages" "$RUNNER_TEMP/bundle/bill.pdf" /home/agent/work/
+          sudo chown -R agent:agent /home/agent/work/pages /home/agent/work/bill.pdf
+          sudo install -m 644 "$RUNNER_TEMP/bundle/prompt.md" /opt/agent/prompt.md
+          echo "Bundle: $(find "$RUNNER_TEMP/bundle/pages" -type f | wc -l) pages"
+
+      # The credential reaches the CLI only through sudo's preserved environment,
+      # never argv (argv is world-readable in /proc). The transcript and stderr
+      # stay runner-only files under the closed home: never printed or uploaded.
+      - name: Agent
+        timeout-minutes: 50
+        env:
+          AGENT_CLAUDE_TOKEN: ${{ secrets.AGENT_CLAUDE_TOKEN }}
+          AGENT_MODEL: ${{ vars.AGENT_MODEL }}
+          AGENT_BUDGET_USD: ${{ vars.AGENT_BUDGET_USD }}
+        run: |
+          model="${AGENT_MODEL:-claude-opus-5-5}"
+          budget="${AGENT_BUDGET_USD:-20}"
+          [[ "$model" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || { echo "::error::AGENT_MODEL is not a model id"; exit 1; }
+          [[ "$budget" =~ ^[0-9]{1,4}(\.[0-9]{1,2})?$ ]] || { echo "::error::AGENT_BUDGET_USD is not an amount in dollars"; exit 1; }
+          [ -n "$AGENT_CLAUDE_TOKEN" ] || { echo "::error::AGENT_CLAUDE_TOKEN is not set"; exit 1; }
+          if [[ "$AGENT_CLAUDE_TOKEN" == sk-ant-api* ]]; then cred=ANTHROPIC_API_KEY; else cred=CLAUDE_CODE_OAUTH_TOKEN; fi
+          export "$cred=$AGENT_CLAUDE_TOKEN"
+          bin=$(dirname "$(command -v claude)")
+          umask 077
+          code=0
+          sudo -u agent -H --preserve-env="$cred" /usr/bin/env -C /home/agent/work \
+            PATH="$bin:/usr/bin:/bin" LANG=C.UTF-8 SHELL=/bin/bash \
+            CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
+            CLAUDE_CODE_DISABLE_CLAUDE_MDS=1 CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 ENABLE_CLAUDEAI_MCP_SERVERS=false \
+            CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL=1 BASH_MAX_TIMEOUT_MS=1800000 \
+            timeout -k 30 45m claude -p 'Write ./out/pages.json for the pages in ./pages, as your instructions say.' \
+              --append-system-prompt-file /opt/agent/prompt.md --model "$model" \
+              --restricted --tools Bash --allowedTools Bash --permission-mode dontAsk --permission-prompts none \
+              --settings /opt/agent/settings.json --strict-mcp-config --disable-slash-commands --no-session-persistence \
+              --max-turns 100 --max-budget-usd "$budget" --output-format stream-json --verbose \
+            < /dev/null > "$RUNNER_TEMP/agent.jsonl" 2> "$RUNNER_TEMP/agent.err" || code=$?
+          # Nothing the agent started lives on, so the file checked below is the one it left.
+          for _ in 1 2 3 4 5; do sudo pkill -KILL -u agent || break; sleep 1; done
+          if pgrep -u agent > /dev/null; then echo "::error::The agent's processes outlived it."; exit 1; fi
+          echo "claude exit code $code"
+          # A regular file with one link, under 256 MB, reached through no symlink.
+          result=/home/agent/work/out/pages.json
+          if [ "$(sudo realpath -e "$result" 2> /dev/null)" = "$result" ] &&
+            [ -n "$(sudo find "$result" -maxdepth 0 -type f -links 1 -size -268435456c)" ]; then
+            sudo cat "$result" > "$RUNNER_TEMP/pages.json"
+          fi
+
+      - name: Check
+        run: node scripts/check-session.mjs "$RUNNER_TEMP/agent.jsonl" "$RUNNER_TEMP/pages.json"
+
+      # Only after a passing check. No result ends the host's wait early, and the
+      # host reads the bill with vision.
+      - name: Seal
+        run: |
+          [ -s "$RUNNER_TEMP/pages.json" ] || { echo "::warning::The agent left no usable out/pages.json."; exit 1; }
+          umask 077
+          mkdir "$RUNNER_TEMP/result"
+          node scripts/seal.mjs seal "$HOST_KEY" "$RUNNER_TEMP/pages.json" "$RUNNER_TEMP/result/pages.sealed"
+
+      - name: Upload agent-result
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: agent-result
+          path: ${{ runner.temp }}/result/pages.sealed
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error

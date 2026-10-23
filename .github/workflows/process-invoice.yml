@@ -19,7 +19,10 @@ on:
         default: "0"
         type: string
 
+# actions: write only for the agent steps (dispatch, wait for, stop and clean up
+# the agent run): no other step holds GH_TOKEN.
 permissions:
+  actions: write
   contents: read
 
 # One bill at a time per lane. queue: max keeps up to 100 runs waiting; without
@@ -84,25 +87,98 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: ${{ secrets.INFRALABS_REPOSITORY }}
-          ref: ${{ secrets.INFRALABS_REF }}
+          # The agent code, or without it the live ref, whose code ignores the agent.
+          ref: ${{ secrets.INFRALABS_AGENT_REF || secrets.INFRALABS_REF }}
           token: ${{ secrets.INFRALABS_REPO_TOKEN }}
           persist-credentials: false
           path: app
 
-      # Caches the npm download cache only, never node_modules (it holds the
-      # generated Prisma client of the private schema).
+      # No npm cache on this branch: agent runs share its cache scope, and nothing
+      # they could write may reach a job that holds the database keys.
       - name: Set up Node
         if: steps.check.outputs.runnable == 'true'
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
-          cache: npm
-          cache-dependency-path: app/package-lock.json
 
       - name: Install dependencies
         if: steps.check.outputs.runnable == 'true'
         working-directory: app
         run: npm ci --no-audit --no-fund > "$RUNNER_TEMP/npm-ci.log" 2>&1 || { tail -n 30 "$RUNNER_TEMP/npm-ci.log"; exit 1; }
+
+      # The agent path (README, "Agent path"), only while AGENT_PATH is on: the
+      # kept pages of a digital PDF go to an agent run (agent.yml) that holds no
+      # secret but its Claude credential, and run-one checks every page it returns
+      # against the PDF's own text layer. Each agent step may fail on its own:
+      # run-one then reads those pages, or the whole bill, with vision.
+      # The bundle is file in, files out; its log, like run.log, stays on the runner.
+      - name: Agent bundle
+        id: bundle
+        if: steps.check.outputs.runnable == 'true' && vars.AGENT_PATH == 'on'
+        continue-on-error: true
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ vars.AWS_REGION || 'ap-southeast-2' }}
+          AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
+        run: |
+          umask 077
+          source scripts/db.sh
+          valid_id "$UPLOAD_ID"
+          # Built from sanitized names (upload-scope.ts). Never printed: it names the customer's file.
+          key=$(db_query "SELECT s3Key FROM Upload WHERE id = '$UPLOAD_ID'")
+          [[ "$key" =~ ^[A-Za-z0-9._/-]{1,512}$ ]] || { echo "::warning::The upload's S3 key is not a plain key: vision reads the bill."; exit 1; }
+          aws s3 cp "s3://$AWS_S3_BUCKET/$key" "$RUNNER_TEMP/agent-bill.pdf" --only-show-errors > /dev/null 2> "$RUNNER_TEMP/agent-s3.err" ||
+            { echo "::warning::The PDF download failed: vision reads the bill."; exit 1; }
+          cd app
+          node --import tsx aws/agent-bundle.ts "$RUNNER_TEMP/agent-bill.pdf" "$RUNNER_TEMP/bundle" > "$RUNNER_TEMP/agent-bundle.log" 2>&1 ||
+            { echo "::warning::The agent bundle failed: vision reads the bill."; exit 1; }
+          if [ -d "$RUNNER_TEMP/bundle/pages" ]; then
+            echo "digital=true" >> "$GITHUB_OUTPUT"
+            echo "Digital: $(find "$RUNNER_TEMP/bundle/pages" -type f | wc -l) kept pages for the agent."
+          else
+            echo "Not digital: vision reads the bill."
+          fi
+
+      # The agent run, on this branch, with this run's public key. Its own key
+      # comes back as its artifact agent-key: only that run's jobs can upload to
+      # it, so the bundle is sealed to that run and no other.
+      - name: Agent dispatch
+        id: dispatch
+        if: steps.bundle.outputs.digital == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          umask 077
+          mkdir "$RUNNER_TEMP/host-key"
+          host_key=$(node scripts/seal.mjs keygen "$RUNNER_TEMP/host-key")
+          run=$(gh api --method POST "repos/$GH_REPO/actions/workflows/agent.yml/dispatches" \
+            -f ref="$GITHUB_REF_NAME" -f "inputs[upload_id]=$UPLOAD_ID" -f "inputs[host_run]=$GITHUB_RUN_ID" \
+            -f "inputs[host_key]=$host_key" -F return_run_details=true --jq .workflow_run_id)
+          [[ "$run" =~ ^[0-9]{1,20}$ ]] || { echo "::warning::The agent dispatch returned no run id."; exit 1; }
+          echo "agent_run=$run" >> "$GITHUB_OUTPUT"
+          echo "Agent run $run"
+          bash scripts/wait-artifact.sh "$run" agent-key 10 "$RUNNER_TEMP/agent-key" 4096
+          agent_key=$(cat "$RUNNER_TEMP/agent-key/key.pub")
+          [[ "$agent_key" =~ ^[A-Za-z0-9+/]{43}=$ ]] || { echo "::warning::agent-key holds no public key."; exit 1; }
+          tar -cf "$RUNNER_TEMP/bundle.tar" -C "$RUNNER_TEMP/bundle" pages bill.pdf prompt.md
+          mkdir "$RUNNER_TEMP/agent-input"
+          node scripts/seal.mjs seal "$agent_key" "$RUNNER_TEMP/bundle.tar" "$RUNNER_TEMP/agent-input/bundle.sealed"
+
+      - name: Upload agent-input
+        id: upload
+        if: steps.dispatch.outcome == 'success'
+        continue-on-error: true
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: agent-input
+          path: ${{ runner.temp }}/agent-input/bundle.sealed
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
 
       # pdfjs crashes inside canvas without fonts (same as the worker image).
       - name: Install fonts
@@ -118,6 +194,48 @@ jobs:
           [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::CLAUDE_CLI_VERSION must be an exact version such as 2.1.295"; exit 1; }
           npm install -g --no-audit --no-fund "@anthropic-ai/claude-code@$version"
           claude --version
+
+      # Up to 75 min, less when the agent run ends first. The result is data:
+      # run-one caps its size, parses it and checks every page before using one.
+      - name: Agent result
+        id: agent
+        if: steps.upload.outcome == 'success'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          AGENT_RUN: ${{ steps.dispatch.outputs.agent_run }}
+        run: |
+          umask 077
+          bash scripts/wait-artifact.sh "$AGENT_RUN" agent-result 75 "$RUNNER_TEMP/agent-result" 283115520
+          node scripts/seal.mjs open "$RUNNER_TEMP/host-key/key.pem" "$RUNNER_TEMP/agent-result/pages.sealed" "$RUNNER_TEMP/agent-pages.json"
+          echo "file=$RUNNER_TEMP/agent-pages.json" >> "$GITHUB_OUTPUT"
+
+      # Past this point the agent run has nothing left to give: stop it unless it
+      # delivered (then it is only finishing its post steps), and delete both
+      # runs' agent artifacts (retention-days 1 is the backstop).
+      - name: Agent cleanup
+        if: always() && steps.dispatch.outputs.agent_run != ''
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          AGENT_RUN: ${{ steps.dispatch.outputs.agent_run }}
+          DELIVERED: ${{ steps.agent.outcome }}
+        run: |
+          [[ "$AGENT_RUN" =~ ^[0-9]{1,20}$ ]] || exit 1
+          api="repos/$GH_REPO/actions"
+          if [ "$DELIVERED" != success ] && [ "$(gh api "$api/runs/$AGENT_RUN" --jq .status)" != completed ]; then
+            gh api --method POST "$api/runs/$AGENT_RUN/cancel" > /dev/null || true
+          fi
+          deleted=0
+          for pair in "$GITHUB_RUN_ID agent-input" "$AGENT_RUN agent-key" "$AGENT_RUN agent-result"; do
+            read -r run name <<< "$pair"
+            for id in $(gh api "$api/runs/$run/artifacts?name=$name" --jq '.artifacts[].id'); do
+              gh api --method DELETE "$api/artifacts/$id" && deleted=$((deleted + 1))
+            done
+          done
+          echo "Deleted $deleted agent artifact(s)."
 
       - name: Process invoice
         id: run
@@ -148,10 +266,13 @@ jobs:
           NODE_OPTIONS: --max-old-space-size=12288
           RUN_RESULT_FILE: ${{ runner.temp }}/result.json
           CLAUDE_OCR_MODEL: ${{ vars.CLAUDE_OCR_MODEL || 'claude-sonnet-5-5' }}
+          # The agent's pages, opened by "Agent result"; empty when there are none.
+          CLAUDE_AGENT_PAGES_FILE: ${{ steps.agent.outputs.file }}
+          CLAUDE_AGENT_MODEL: ${{ vars.AGENT_MODEL || 'claude-opus-5-5' }}
         run: |
           # A secret that is not set arrives as "". Unset those, so an empty
           # ANTHROPIC_API_KEY cannot shadow the OAuth token.
-          for name in CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY OPENAI_API_KEY LLM_GENERIC_PARSER_ENABLED; do
+          for name in CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY OPENAI_API_KEY LLM_GENERIC_PARSER_ENABLED CLAUDE_AGENT_PAGES_FILE; do
             [ -n "${!name:-}" ] || unset "$name"
           done
           # Missing config must not fail a customer's upload: stop before run-one claims it.
@@ -190,13 +311,13 @@ jobs:
           {
             echo "### run-one exit code: ${CODE:-none}"
             if [ -s "$RESULT_FILE" ]; then
-              echo "| Status | Upload | Pages | Calls | Re-reads | Unresolved | Failed | Minutes | Model |"
-              echo "|---|---|---|---|---|---|---|---|---|"
+              echo "| Status | Upload | Pages | Agent pages | Calls | Re-reads | Unresolved | Failed | Minutes | Model |"
+              echo "|---|---|---|---|---|---|---|---|---|---|"
               jq -r 'def safe: if type == "number" then (. * 10 | round / 10 | tostring)
                   elif type == "array" then (length | tostring)
                   elif type == "string" and test("^[A-Za-z0-9._:/\\[\\]-]{1,64}$") then .
                   else "-" end;
-                "| \(.status | safe) | \(.uploadStatus | safe) | \(.pages | safe) | \(.calls | safe) | \(.rereads | safe) | \(.unresolved | safe) | \(.failed | safe) | \(.minutes | safe) | \(.model | safe) |"' \
+                "| \(.status | safe) | \(.uploadStatus | safe) | \(.pages | safe) | \(.agentPages | safe) | \(.calls | safe) | \(.rereads | safe) | \(.unresolved | safe) | \(.failed | safe) | \(.minutes | safe) | \(.model | safe) |"' \
                 "$RESULT_FILE" || echo "The result file is not valid JSON."
             else
               echo "No result file."

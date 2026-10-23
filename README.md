@@ -208,14 +208,14 @@ pages". To stop an invoice for good, fail or delete it in the platform.
   print only counts, statuses, the opaque upload id and setup output: the subject line of the InfralabsIQ commit at
   `INFRALABS_REF` (actions/checkout prints it), npm and apt output, and the last 30 lines of a failed `npm ci`. Keep
   the subject of that commit free of customer data. run-one writes its own log (file names, services, amounts) to
-  `$RUNNER_TEMP/run.log`, which is never printed or uploaded, and there are no artifacts. Keep it that way: no
-  `cat run.log`, no `upload-artifact`, no `set -x`.
+  `$RUNNER_TEMP/run.log`, which is never printed or uploaded, and the only artifacts are the agent path's sealed ones
+  (see "Agent path"). Keep it that way: no `cat run.log`, no other `upload-artifact`, no `set -x`.
 - **Triggers.** Only `workflow_dispatch` and `schedule`. Never add `pull_request` or `pull_request_target`: a pull
   request from a fork must never run next to these secrets. Only people with write access can dispatch a run.
 - **Secrets.** `db.sh` masks every part of `DATABASE_URL` before anything can print it, keeps it in a 0600 file under
   `$RUNNER_TEMP` and hides mysql's error text (it names the host and the user). The bucket and the private repo name
-  are secrets, because env blocks print variables in clear text. `DATABASE_URL` reaches only the three steps that
-  query the database; the app secrets reach only the "Process invoice" step.
+  are secrets, because env blocks print variables in clear text. `DATABASE_URL` reaches only the steps that query
+  the database; the app secrets reach only the "Process invoice" step, and the AWS keys "Agent bundle" too.
 - **Claude has no tools.** Invoice text is untrusted input. run-one starts `claude -p` with no tools, no MCP servers,
   an empty working directory and an allowlisted environment without database or AWS credentials (see
   `src/lib/claude/cli.ts` in InfralabsIQ).
@@ -284,3 +284,70 @@ reference bill, in `bench-out/report.md` and `report.json`. Run it on the runner
 `npm i --prefix <dir> @anthropic-ai/claude-code@2.1.295` and `CLAUDE_BIN=<dir>/node_modules/.bin/claude` (on Windows,
 point `CLAUDE_BIN` at the `claude.exe` the package installs, never the `.cmd` shim). Details in
 `docs/claude-pipeline.md` there.
+
+## Agent path (branch `agent`)
+
+For a digital PDF, an agent writes and runs a program that turns the bill's kept pages into the same per-page JSON the
+vision reader returns, and run-one's own checks accept or refuse it page by page and for the whole bill. Off by
+default, in three places: the platform's `INVOICE_GITHUB_REF` stays `main`, `AGENT_PATH` stays unset here, and
+`CLAUDE_AGENT_PAGES_FILE` is set only by this branch's workflow.
+
+**What runs where.**
+
+- `process-invoice.yml` on this branch (the host run) is main's file plus agent steps, each `continue-on-error`:
+  "Agent bundle" reads the PDF from S3 and runs `aws/agent-bundle.ts` (a PDF whose pages nearly all carry a text
+  layer gets its kept digital pages' text, the PDF and the prompt; any other PDF gets nothing); "Agent dispatch"
+  starts `agent.yml` on this branch with this run's public key and waits for that run's key (artifact `agent-key`);
+  "Upload agent-input" sends the bundle sealed to it; "Agent result" waits up to 75 min for `agent-result` and opens
+  it; "Agent cleanup" stops the agent run if it did not deliver and deletes both runs' artifacts. run-one gets the
+  result as `CLAUDE_AGENT_PAGES_FILE`, checks every page against the PDF's own text layer, reads the rest with vision,
+  checks the bill, and reads it all with vision if the bill check refuses. The run summary gains "Agent pages".
+- `agent.yml` on this branch (the agent run, up to 80 min): the Claude Code CLI with Bash only, as its own user in an
+  OS jail (`scripts/agent-jail.sh`) and the Claude Code sandbox (`agent/settings.json`), writes `out/pages.json`.
+  `scripts/check-session.mjs` fails the run unless the session started with no tool but Bash, no MCP server, no
+  plugin and permission mode dontAsk; then the result goes back sealed to the host run's key (`scripts/seal.mjs`).
+- `agent.yml` on `main` is a stub with no secret: `workflow_dispatch` finds a workflow only when its file is on the
+  default branch. Run it once by hand at setup, before the first agent run (it reads no input):
+  `gh workflow run agent.yml -R "$REPO" -f upload_id=setup -f host_run=0 -f host_key=setup`.
+- The parent sweep still dispatches `main`, so a lost or deferred bill of this branch resumes with vision only.
+
+**Secrets each workflow holds.** The host run: the secrets in "Setup", plus `INFRALABS_AGENT_REF`; the GitHub token
+(`actions: write`) only in "Agent dispatch", "Agent result" and "Agent cleanup", none of which holds a database, AWS
+or Claude secret. The agent run: `AGENT_CLAUDE_TOKEN`, only in its "Agent" step, and the GitHub token
+(`actions: read`) only in its "Input" step. The stub: none.
+
+| Secret | Value |
+|---|---|
+| `AGENT_CLAUDE_TOKEN` | The agent's Claude credential, in agent.yml only. For production a Console API key (`sk-ant-api...`) in its own workspace with a spend limit, rotated after any anomaly; a `claude setup-token` token works for a test, with the terms caveat above. An `sk-ant-api` value is passed as `ANTHROPIC_API_KEY`, anything else as `CLAUDE_CODE_OAUTH_TOKEN`. |
+| `INFRALABS_AGENT_REF` | Commit SHA or tag of InfralabsIQ with the agent code (feature/agent-path), not a branch, as for `INFRALABS_REF`. Unset: `INFRALABS_REF`, whose code ignores the agent. |
+
+| Variable | Default | Value |
+|---|---|---|
+| `AGENT_PATH` | unset | `on` runs the agent steps. Anything else: vision only, as on `main`. |
+| `AGENT_MODEL` | `claude-opus-5-5` | The agent's model. |
+| `AGENT_BUDGET_USD` | `20` | The agent session's `--max-budget-usd`. Its turns are capped at 100 and its time at 45 min. |
+
+`CLAUDE_CLI_VERSION` pins the agent's CLI too.
+
+**Kill switch.** `gh variable set AGENT_PATH -R "$REPO" --body off`: every host run that starts after it reads with
+vision, no restart. To send nothing to this branch at all, set the platform's `INVOICE_GITHUB_REF` back to `main`.
+
+**Threat model.**
+
+1. Bill text, visible or hidden in its text layer, may steer the agent: it is untrusted from the first byte.
+2. The agent's VM holds no database, AWS, OpenAI, Gmail or private-repo secret, only its Claude credential, and the
+   agent's commands run without it. Nor can they read it from the CLI, which runs as the same user: each command runs
+   in the sandbox's own PID namespace with a fresh /proc, which the jail's self-test checks on every run through the
+   same sandbox runtime (`srt`), failing the run if it does not hold. The env scrub's own /proc isolation is
+   best-effort.
+3. The jail holds even if the sandbox or its settings fail: its own user without sudo or docker, a closed runner home,
+   every local socket closed to it, egress only to Anthropic's API (no DNS), and a self-test on every run.
+4. The bill and the result travel only as artifacts sealed to keys made in each run, which the host run deletes at
+   its end; logs and summaries carry counts only.
+5. The agent never decides: run-one checks every page and the whole bill, and reads anything refused with vision. The
+   residual risk is a kernel or sandbox escape, which exposes this one bill and the agent credential: hence a
+   dedicated, spend-capped key.
+
+**Before pushing this branch.** `git ls-remote https://github.com/actions/upload-artifact refs/tags/v7.0.2` must print
+`cf430e030ddbb5b0abf93d22962f4752f3646cd9`, the SHA both agent workflows pin, and `node scripts/seal.mjs test` and
+`node scripts/check-session.mjs --selftest` must pass.
