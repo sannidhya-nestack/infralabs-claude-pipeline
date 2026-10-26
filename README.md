@@ -289,27 +289,58 @@ point `CLAUDE_BIN` at the `claude.exe` the package installs, never the `.cmd` sh
 
 For a digital PDF, an agent writes and runs a program that turns the bill's kept pages into the same per-page JSON the
 vision reader returns, and run-one's own checks accept or refuse it page by page and for the whole bill. Off by
-default, in three places: the platform's `INVOICE_GITHUB_REF` stays `main`, `AGENT_PATH` stays unset here, and
-`CLAUDE_AGENT_PAGES_FILE` is set only by this branch's workflow.
+default, in four places: the platform's `INVOICE_GITHUB_REF` stays `main`, `AGENT_PATH` and `LAYER_PAGES` stay unset
+here, and `CLAUDE_AGENT_PAGES_FILE` is set only by this branch's workflow.
+
+**The layer path.** `LAYER_PAGES=on` reaches run-one as `CLAUDE_LAYER_PAGES=on`: a digital bill's kept pages are first
+read from the PDF's text layer by a fixed converter in InfralabsIQ, under the same checks. When the bill check refuses
+its records, run-one tries the agent's result, then vision; a program that supplied no page is not tried again. It
+needs no agent run, jail or secret, only InfralabsIQ code that has it (`INFRALABS_AGENT_REF`); `INFRALABS_REF`'s code
+ignores the variable.
+
+**The fallback cap.** With `AGENT_FALLBACK_MAX_PAGES` set, records the bill check refuses stay when their program
+supplied more pages than that and no program left supplies one: run-one stores them for a person ("Records from the
+PDF text layer do not verify: check them against the bill", never auto-approved) instead of reading every page again
+with vision, about 25 hours at 23,000 pages. Unset, every refusal falls back to vision.
 
 **What runs where.**
 
 - `process-invoice.yml` on this branch (the host run) is main's file plus agent steps, each `continue-on-error`:
   "Agent bundle" reads the PDF from S3 and runs `aws/agent-bundle.ts` (a PDF whose pages nearly all carry a text
-  layer gets its kept digital pages' text, the PDF and the prompt; any other PDF gets nothing); "Agent dispatch"
-  starts `agent.yml` on this branch with this run's public key and waits for that run's key (artifact `agent-key`);
-  "Upload agent-input" sends the bundle sealed to it; "Agent result" waits up to 75 min for `agent-result` and opens
-  it; "Agent cleanup" stops the agent run if it did not deliver and deletes both runs' artifacts. run-one gets the
-  result as `CLAUDE_AGENT_PAGES_FILE`, checks every page against the PDF's own text layer, reads the rest with vision,
-  checks the bill, and reads it all with vision if the bill check refuses. The run summary gains "Agent pages".
+  layer gets, for each kept digital page, its text `pages/NNNNN.txt` and its printed lines with their positions
+  `pages/NNNNN.json`, plus `check.mjs`, run-one's own page check, and the prompt; never the PDF; any other PDF gets
+  nothing); "Agent dispatch" starts `agent.yml` on this branch with this run's public key and waits for that run's key
+  (artifact `agent-key`); "Upload agent-input" sends the bundle, gzipped (a 23,123-page bill's is 352 MB as a plain
+  tar, over `seal.mjs`'s 256 MB cap, and 22 MB gzipped), sealed to it; "Agent result" waits up to `AGENT_WAIT_MIN`
+  for `agent-result` and opens it; "Agent cleanup" stops the agent run if it did not deliver and deletes both runs'
+  artifacts. run-one gets the result as `CLAUDE_AGENT_PAGES_FILE`, checks every page against the PDF's own text layer,
+  reads the rest with vision, checks the bill, and when the bill check refuses reads it again without the agent (with
+  vision, or under the fallback cap not at all). The run summary gains "Agent pages", the pages of the stored reading
+  that a program supplied, the layer path's included, and a line when a bill missed the agent because the bundle, the
+  dispatch or key, or the agent run's result failed.
 - `agent.yml` on this branch (the agent run, up to 80 min): the Claude Code CLI with Bash only, as its own user in an
-  OS jail (`scripts/agent-jail.sh`) and the Claude Code sandbox (`agent/settings.json`), writes `out/pages.json`.
-  `scripts/check-session.mjs` fails the run unless the session started with no tool but Bash, no MCP server, no
-  plugin and permission mode dontAsk; then the result goes back sealed to the host run's key (`scripts/seal.mjs`).
+  OS jail (`scripts/agent-jail.sh`) and the Claude Code sandbox (`agent/settings.json`), writes `out/pages.json` and
+  runs `node ./check.mjs` on it until it passes. The pages are the agent's copy. The prompt is root's, and so is
+  `check.mjs`, which the agent cannot edit but could replace in its own folder: that fools only itself, as run-one
+  checks every page again. The session starts with the probe (below), and `scripts/check-session.mjs` fails the run
+  unless the session started with no tool but Bash, no MCP server, no plugin and permission mode dontAsk, and the
+  probe passed; then the result goes back sealed to the host run's key (`scripts/seal.mjs`).
 - `agent.yml` on `main` is a stub with no secret: `workflow_dispatch` finds a workflow only when its file is on the
   default branch. Run it once by hand at setup, before the first agent run (it reads no input):
   `gh workflow run agent.yml -R "$REPO" -f upload_id=setup -f host_run=0 -f host_key=setup`.
 - The parent sweep still dispatches `main`, so a lost or deferred bill of this branch resumes with vision only.
+
+**The probe.** The `-p` prompt names the session's first command, to run before the agent reads any file, so no bill
+can steer it: `touch /usr/p; echo "probe pids $(ls /proc | grep -c '^[0-9]') creds $(printenv | grep -c sk-ant-)"`
+(`PROBE` in `scripts/check-session.mjs`). The CLI's stream goes through a watcher (`check-session.mjs --watch`) that
+kills every agent process unless the init event passes and the probe's own result shows the sandbox holding: the
+write refused with "Read-only file system" (outside the sandbox the agent gets "Permission denied" there; its home is
+no test, as the sandbox hides it under a writable tmpfs), fewer than 20 processes in the command's PID namespace (the
+runner's own count is in the hundreds) and no credential line in its environment. It fails closed: a session that
+runs anything else first, or ends before the probe, gets no result either, and the Agent step's log names the reason
+in a token and counts. The bound of 20 comes from the CLI's sandbox code (about 10 processes: bubblewrap's init, its
+shell, two network bridges with their subshells, the command's shells, `ls` and `grep`); the "Probe: ok" log line
+shows the real count, so tighten it after the canary.
 
 **Secrets each workflow holds.** The host run: the secrets in "Setup", plus `INFRALABS_AGENT_REF`; the GitHub token
 (`actions: write`) only in "Agent dispatch", "Agent result" and "Agent cleanup", none of which holds a database, AWS
@@ -318,19 +349,24 @@ or Claude secret. The agent run: `AGENT_CLAUDE_TOKEN`, only in its "Agent" step,
 
 | Secret | Value |
 |---|---|
-| `AGENT_CLAUDE_TOKEN` | The agent's Claude credential, in agent.yml only. For production a Console API key (`sk-ant-api...`) in its own workspace with a spend limit, rotated after any anomaly; a `claude setup-token` token works for a test, with the terms caveat above. An `sk-ant-api` value is passed as `ANTHROPIC_API_KEY`, anything else as `CLAUDE_CODE_OAUTH_TOKEN`. |
+| `AGENT_CLAUDE_TOKEN` | The agent's Claude credential, in agent.yml only: a Console API key (`sk-ant-api...`) in its own workspace with a spend limit, rotated after any anomaly, for the canary too. The Agent step refuses anything else. Never a `claude setup-token` token and never production's `CLAUDE_CODE_OAUTH_TOKEN`: with a subscription token, only CLI flags keep the account's claude.ai connectors (mail, drive) away from bill text, and the agent would spend production's usage window. |
 | `INFRALABS_AGENT_REF` | Commit SHA or tag of InfralabsIQ with the agent code (feature/agent-path), not a branch, as for `INFRALABS_REF`. Unset: `INFRALABS_REF`, whose code ignores the agent. |
 
 | Variable | Default | Value |
 |---|---|---|
-| `AGENT_PATH` | unset | `on` runs the agent steps. Anything else: vision only, as on `main`. |
+| `AGENT_PATH` | unset | `on` runs the agent steps. Anything else: no agent, as on `main` (the layer path still runs when `LAYER_PAGES` is on). |
+| `LAYER_PAGES` | unset | `on` reads a digital bill's kept pages from its text layer first ("The layer path"). Unset: run-one never sees the variable. |
+| `AGENT_FALLBACK_MAX_PAGES` | unset | A number of pages: over it, records the bill check refuses stay for a person ("The fallback cap"). Unset: always fall back to vision. |
 | `AGENT_MODEL` | `claude-opus-5-5` | The agent's model. |
-| `AGENT_BUDGET_USD` | `20` | The agent session's `--max-budget-usd`. Its turns are capped at 100 and its time at 45 min. |
+| `AGENT_BUDGET_USD` | `20` | The agent session's `--max-budget-usd`. Its turns are capped at 100 and its time at `AGENT_TIMEOUT_MIN`. |
+| `AGENT_TIMEOUT_MIN` | `30` | The agent session's time limit, 1 to 45 minutes (the Agent step's own cap is 50). |
+| `AGENT_WAIT_MIN` | `40` | How long the host run waits for the agent's result once it has sent the bill, holding its lane meanwhile. Keep it about 10 above `AGENT_TIMEOUT_MIN`, or the host stops waiting while the agent still runs. |
 
 `CLAUDE_CLI_VERSION` pins the agent's CLI too.
 
-**Kill switch.** `gh variable set AGENT_PATH -R "$REPO" --body off`: every host run that starts after it reads with
-vision, no restart. To send nothing to this branch at all, set the platform's `INVOICE_GITHUB_REF` back to `main`.
+**Kill switch.** `gh variable set AGENT_PATH -R "$REPO" --body off`: every host run that starts after it reads without
+the agent, no restart; delete `LAYER_PAGES` too for vision only. To send nothing to this branch at all, set the
+platform's `INVOICE_GITHUB_REF` back to `main`.
 
 **Threat model.**
 
@@ -338,15 +374,15 @@ vision, no restart. To send nothing to this branch at all, set the platform's `I
 2. The agent's VM holds no database, AWS, OpenAI, Gmail or private-repo secret, only its Claude credential, and the
    agent's commands run without it. Nor can they read it from the CLI, which runs as the same user: each command runs
    in the sandbox's own PID namespace with a fresh /proc, which the jail's self-test checks on every run through the
-   same sandbox runtime (`srt`), failing the run if it does not hold. The env scrub's own /proc isolation is
-   best-effort.
+   same sandbox runtime (`srt`), failing the run if it does not hold, and which the probe checks again in the session
+   itself before any page is read. The env scrub's own /proc isolation is best-effort.
 3. The jail holds even if the sandbox or its settings fail: its own user without sudo or docker, a closed runner home,
    every local socket closed to it, egress only to Anthropic's API (no DNS), and a self-test on every run.
 4. The bill and the result travel only as artifacts sealed to keys made in each run, which the host run deletes at
    its end; logs and summaries carry counts only.
-5. The agent never decides: run-one checks every page and the whole bill, and reads anything refused with vision. The
-   residual risk is a kernel or sandbox escape, which exposes this one bill and the agent credential: hence a
-   dedicated, spend-capped key.
+5. The agent never decides: run-one checks every page and the whole bill, and reads anything refused with vision, or,
+   under the fallback cap, holds the refused records for a person. The residual risk is a kernel or sandbox escape,
+   which exposes this one bill and the agent credential: hence a dedicated, spend-capped key.
 
 **Before pushing this branch.** `git ls-remote https://github.com/actions/upload-artifact refs/tags/v7.0.2` must print
 `cf430e030ddbb5b0abf93d22962f4752f3646cd9`, the SHA both agent workflows pin, and `node scripts/seal.mjs test` and

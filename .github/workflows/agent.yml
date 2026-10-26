@@ -90,7 +90,7 @@ jobs:
         run: |
           version="${CLAUDE_CLI_VERSION:-2.1.295}"
           [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::CLAUDE_CLI_VERSION must be an exact version such as 2.1.295"; exit 1; }
-          sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends bubblewrap socat poppler-utils acl ripgrep
+          sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends bubblewrap socat acl ripgrep
           npm install -g --no-audit --no-fund "@anthropic-ai/claude-code@$version" @anthropic-ai/sandbox-runtime@0.0.79
           claude --version
 
@@ -100,7 +100,12 @@ jobs:
           node scripts/check-session.mjs --selftest
           sudo bash scripts/agent-jail.sh "$HOME" "$$" "$(dirname "$(command -v srt)")"
 
-      # The only step with the GitHub token: the bill, from the host run.
+      # The only step with the GitHub token: the bill, from the host run. Each
+      # kept page as text (pages/NNNNN.txt) and as printed lines with their
+      # positions (pages/NNNNN.json), the agent's own copy; check.mjs, run-one's
+      # page check, and the prompt are root's, for the agent to read and run.
+      # ponytail: the agent owns the work dir, so it could still swap check.mjs
+      # for another; that fools only itself, as run-one checks every page again.
       - name: Input
         env:
           GH_TOKEN: ${{ github.token }}
@@ -108,49 +113,67 @@ jobs:
         run: |
           umask 077
           bash scripts/wait-artifact.sh "$HOST_RUN" agent-input 20 "$RUNNER_TEMP/input" 283115520
-          node scripts/seal.mjs open "$RUNNER_TEMP/key/key.pem" "$RUNNER_TEMP/input/bundle.sealed" "$RUNNER_TEMP/bundle.tar"
+          node scripts/seal.mjs open "$RUNNER_TEMP/key/key.pem" "$RUNNER_TEMP/input/bundle.sealed" "$RUNNER_TEMP/bundle.tgz"
           mkdir "$RUNNER_TEMP/bundle"
-          tar -xf "$RUNNER_TEMP/bundle.tar" -C "$RUNNER_TEMP/bundle" --no-same-owner --no-same-permissions
-          sudo cp -R "$RUNNER_TEMP/bundle/pages" "$RUNNER_TEMP/bundle/bill.pdf" /home/agent/work/
-          sudo chown -R agent:agent /home/agent/work/pages /home/agent/work/bill.pdf
+          # A gzipped tar (the host's "Agent dispatch"): tar finds the gzip itself.
+          tar -xf "$RUNNER_TEMP/bundle.tgz" -C "$RUNNER_TEMP/bundle" --no-same-owner --no-same-permissions
+          sudo cp -R "$RUNNER_TEMP/bundle/pages" /home/agent/work/
+          sudo chown -R agent:agent /home/agent/work/pages
+          sudo install -m 644 "$RUNNER_TEMP/bundle/check.mjs" /home/agent/work/check.mjs
           sudo install -m 644 "$RUNNER_TEMP/bundle/prompt.md" /opt/agent/prompt.md
-          echo "Bundle: $(find "$RUNNER_TEMP/bundle/pages" -type f | wc -l) pages"
+          echo "Bundle: $(find "$RUNNER_TEMP/bundle/pages" -type f -name '*.txt' | wc -l) pages"
 
       # The credential reaches the CLI only through sudo's preserved environment,
       # never argv (argv is world-readable in /proc). The transcript and stderr
       # stay runner-only files under the closed home: never printed or uploaded.
+      # The session's first command is the probe (scripts/check-session.mjs),
+      # named in the -p prompt before any bill text is in context, so no bill can
+      # steer it. The watcher reads the stream as the CLI writes it and kills
+      # every agent process unless the init event passes and the probe shows the
+      # sandbox holding: a read-only root, its own PID namespace, no credential in
+      # the command's environment. Fail closed: no passing probe, no result.
       - name: Agent
         timeout-minutes: 50
         env:
           AGENT_CLAUDE_TOKEN: ${{ secrets.AGENT_CLAUDE_TOKEN }}
           AGENT_MODEL: ${{ vars.AGENT_MODEL }}
           AGENT_BUDGET_USD: ${{ vars.AGENT_BUDGET_USD }}
+          AGENT_TIMEOUT_MIN: ${{ vars.AGENT_TIMEOUT_MIN }}
         run: |
           model="${AGENT_MODEL:-claude-opus-5-5}"
           budget="${AGENT_BUDGET_USD:-20}"
+          minutes="${AGENT_TIMEOUT_MIN:-30}"
           [[ "$model" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || { echo "::error::AGENT_MODEL is not a model id"; exit 1; }
           [[ "$budget" =~ ^[0-9]{1,4}(\.[0-9]{1,2})?$ ]] || { echo "::error::AGENT_BUDGET_USD is not an amount in dollars"; exit 1; }
-          [ -n "$AGENT_CLAUDE_TOKEN" ] || { echo "::error::AGENT_CLAUDE_TOKEN is not set"; exit 1; }
-          if [[ "$AGENT_CLAUDE_TOKEN" == sk-ant-api* ]]; then cred=ANTHROPIC_API_KEY; else cred=CLAUDE_CODE_OAUTH_TOKEN; fi
-          export "$cred=$AGENT_CLAUDE_TOKEN"
+          # Up to 45, under the step's own 50 min cap.
+          [[ "$minutes" =~ ^[1-9][0-9]?$ ]] && [ "$minutes" -le 45 ] || { echo "::error::AGENT_TIMEOUT_MIN is not a number of minutes from 1 to 45"; exit 1; }
+          # A Console API key in its own workspace, never a setup-token (README, "Agent path").
+          [[ "$AGENT_CLAUDE_TOKEN" == sk-ant-api* ]] || { echo "::error::AGENT_CLAUDE_TOKEN is not set, or not a Console API key (sk-ant-api...)"; exit 1; }
+          export ANTHROPIC_API_KEY="$AGENT_CLAUDE_TOKEN"
+          prompt=$(node scripts/check-session.mjs --prompt)
           bin=$(dirname "$(command -v claude)")
           umask 077
-          code=0
-          sudo -u agent -H --preserve-env="$cred" /usr/bin/env -C /home/agent/work \
+          set +e
+          sudo -u agent -H --preserve-env=ANTHROPIC_API_KEY /usr/bin/env -C /home/agent/work \
             PATH="$bin:/usr/bin:/bin" LANG=C.UTF-8 SHELL=/bin/bash \
             CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
             CLAUDE_CODE_DISABLE_CLAUDE_MDS=1 CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 ENABLE_CLAUDEAI_MCP_SERVERS=false \
             CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL=1 BASH_MAX_TIMEOUT_MS=1800000 \
-            timeout -k 30 45m claude -p 'Write ./out/pages.json for the pages in ./pages, as your instructions say.' \
+            timeout -k 30 "${minutes}m" claude -p "$prompt" \
               --append-system-prompt-file /opt/agent/prompt.md --model "$model" \
               --restricted --tools Bash --allowedTools Bash --permission-mode dontAsk --permission-prompts none \
               --settings /opt/agent/settings.json --strict-mcp-config --disable-slash-commands --no-session-persistence \
               --max-turns 100 --max-budget-usd "$budget" --output-format stream-json --verbose \
-            < /dev/null > "$RUNNER_TEMP/agent.jsonl" 2> "$RUNNER_TEMP/agent.err" || code=$?
+            < /dev/null 2> "$RUNNER_TEMP/agent.err" |
+            node scripts/check-session.mjs --watch "$RUNNER_TEMP/agent.jsonl" sudo pkill -KILL -u agent
+          codes=("${PIPESTATUS[@]}")
+          set -e
           # Nothing the agent started lives on, so the file checked below is the one it left.
           for _ in 1 2 3 4 5; do sudo pkill -KILL -u agent || break; sleep 1; done
           if pgrep -u agent > /dev/null; then echo "::error::The agent's processes outlived it."; exit 1; fi
-          echo "claude exit code $code"
+          echo "claude exit code ${codes[0]}"
+          # The watcher has said why, in tokens and counts.
+          [ "${codes[1]}" = 0 ] || exit 1
           # A regular file with one link, under 256 MB, reached through no symlink.
           result=/home/agent/work/out/pages.json
           if [ "$(sudo realpath -e "$result" 2> /dev/null)" = "$result" ] &&

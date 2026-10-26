@@ -103,6 +103,11 @@ function selftest() {
     assert.throws(() => open(pem, seal(pub, Buffer.alloc(4096)), 4095), /larger than|maxOutputLength|Cannot create a Buffer/i);
     assert.deepEqual(open(pem, seal(pub, Buffer.alloc(4096)), 4096), Buffer.alloc(4096));
     assert.throws(() => seal(pub, Buffer.alloc(4097), 4096), /over 4096 bytes/);
+    // The host gzips the agent's bundle first (process-invoice.yml, "Agent dispatch"): one over
+    // the cap as a plain tar seals and opens under it gzipped, and unpacks whole.
+    const bundle = Buffer.alloc(8192, "pages/00001.txt ");
+    assert.throws(() => seal(pub, bundle, 4096), /over 4096 bytes/);
+    assert.deepEqual(zlib.gunzipSync(open(pem, seal(pub, zlib.gzipSync(bundle), 4096), 4096)), bundle);
     // Not a key: wrong length, not canonical base64.
     assert.throws(() => seal(pub.slice(0, 40), plain), /not a raw X25519/);
     assert.throws(() => seal(`${pub.slice(0, 42)}B=`, plain), /not a raw X25519/);

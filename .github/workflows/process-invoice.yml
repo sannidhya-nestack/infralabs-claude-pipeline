@@ -112,6 +112,8 @@ jobs:
       # against the PDF's own text layer. Each agent step may fail on its own:
       # run-one then reads those pages, or the whole bill, with vision.
       # The bundle is file in, files out; its log, like run.log, stays on the runner.
+      # A digital PDF's bundle: each kept page as text and as printed lines with
+      # their positions (pages/NNNNN.txt, .json), check.mjs and prompt.md; no PDF.
       - name: Agent bundle
         id: bundle
         if: steps.check.outputs.runnable == 'true' && vars.AGENT_PATH == 'on'
@@ -136,7 +138,7 @@ jobs:
             { echo "::warning::The agent bundle failed: vision reads the bill."; exit 1; }
           if [ -d "$RUNNER_TEMP/bundle/pages" ]; then
             echo "digital=true" >> "$GITHUB_OUTPUT"
-            echo "Digital: $(find "$RUNNER_TEMP/bundle/pages" -type f | wc -l) kept pages for the agent."
+            echo "Digital: $(find "$RUNNER_TEMP/bundle/pages" -type f -name '*.txt' | wc -l) kept pages for the agent."
           else
             echo "Not digital: vision reads the bill."
           fi
@@ -164,9 +166,12 @@ jobs:
           bash scripts/wait-artifact.sh "$run" agent-key 10 "$RUNNER_TEMP/agent-key" 4096
           agent_key=$(cat "$RUNNER_TEMP/agent-key/key.pub")
           [[ "$agent_key" =~ ^[A-Za-z0-9+/]{43}=$ ]] || { echo "::warning::agent-key holds no public key."; exit 1; }
-          tar -cf "$RUNNER_TEMP/bundle.tar" -C "$RUNNER_TEMP/bundle" pages bill.pdf prompt.md
+          # Gzipped first: seal.mjs seals at most 256 MB, and the 23,123-page bill's
+          # pages are 352 MB as a plain tar, 22 MB gzipped. The agent's tar -xf
+          # reads either.
+          tar -czf "$RUNNER_TEMP/bundle.tgz" -C "$RUNNER_TEMP/bundle" pages check.mjs prompt.md
           mkdir "$RUNNER_TEMP/agent-input"
-          node scripts/seal.mjs seal "$agent_key" "$RUNNER_TEMP/bundle.tar" "$RUNNER_TEMP/agent-input/bundle.sealed"
+          node scripts/seal.mjs seal "$agent_key" "$RUNNER_TEMP/bundle.tgz" "$RUNNER_TEMP/agent-input/bundle.sealed"
 
       - name: Upload agent-input
         id: upload
@@ -195,8 +200,9 @@ jobs:
           npm install -g --no-audit --no-fund "@anthropic-ai/claude-code@$version"
           claude --version
 
-      # Up to 75 min, less when the agent run ends first. The result is data:
-      # run-one caps its size, parses it and checks every page before using one.
+      # Up to AGENT_WAIT_MIN (40 min unless set), less when the agent run ends
+      # first; the lane stays held meanwhile. The result is data: run-one caps
+      # its size, parses it and checks every page before using one.
       - name: Agent result
         id: agent
         if: steps.upload.outcome == 'success'
@@ -205,9 +211,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           AGENT_RUN: ${{ steps.dispatch.outputs.agent_run }}
+          AGENT_WAIT_MIN: ${{ vars.AGENT_WAIT_MIN }}
         run: |
           umask 077
-          bash scripts/wait-artifact.sh "$AGENT_RUN" agent-result 75 "$RUNNER_TEMP/agent-result" 283115520
+          bash scripts/wait-artifact.sh "$AGENT_RUN" agent-result "${AGENT_WAIT_MIN:-40}" "$RUNNER_TEMP/agent-result" 283115520
           node scripts/seal.mjs open "$RUNNER_TEMP/host-key/key.pem" "$RUNNER_TEMP/agent-result/pages.sealed" "$RUNNER_TEMP/agent-pages.json"
           echo "file=$RUNNER_TEMP/agent-pages.json" >> "$GITHUB_OUTPUT"
 
@@ -269,10 +276,14 @@ jobs:
           # The agent's pages, opened by "Agent result"; empty when there are none.
           CLAUDE_AGENT_PAGES_FILE: ${{ steps.agent.outputs.file }}
           CLAUDE_AGENT_MODEL: ${{ vars.AGENT_MODEL || 'claude-opus-5-5' }}
+          # "on": a digital bill's kept pages from its text layer first, by run-one's own converter.
+          CLAUDE_LAYER_PAGES: ${{ vars.LAYER_PAGES }}
+          # Over this many program pages, records that do not verify stay for a person, never read again with vision.
+          CLAUDE_AGENT_FALLBACK_MAX_PAGES: ${{ vars.AGENT_FALLBACK_MAX_PAGES }}
         run: |
-          # A secret that is not set arrives as "". Unset those, so an empty
-          # ANTHROPIC_API_KEY cannot shadow the OAuth token.
-          for name in CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY OPENAI_API_KEY LLM_GENERIC_PARSER_ENABLED CLAUDE_AGENT_PAGES_FILE; do
+          # A secret or variable that is not set arrives as "". Unset those, so an
+          # empty ANTHROPIC_API_KEY cannot shadow the OAuth token.
+          for name in CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY OPENAI_API_KEY LLM_GENERIC_PARSER_ENABLED CLAUDE_AGENT_PAGES_FILE CLAUDE_LAYER_PAGES CLAUDE_AGENT_FALLBACK_MAX_PAGES; do
             [ -n "${!name:-}" ] || unset "$name"
           done
           # Missing config must not fail a customer's upload: stop before run-one claims it.
@@ -306,6 +317,10 @@ jobs:
         env:
           RESULT_FILE: ${{ runner.temp }}/result.json
           CODE: ${{ steps.run.outputs.code }}
+          BUNDLE: ${{ steps.bundle.outcome }}
+          DIGITAL: ${{ steps.bundle.outputs.digital }}
+          DISPATCH: ${{ steps.dispatch.outcome }}
+          DELIVERED: ${{ steps.agent.outcome }}
         run: |
           # Aggregates only: anything that is not a number or a short plain token prints as "-".
           {
@@ -321,6 +336,16 @@ jobs:
                 "$RESULT_FILE" || echo "The result file is not valid JSON."
             else
               echo "No result file."
+            fi
+            # A bill that missed the agent because a step failed says so here, so
+            # a run of them (every digital bill on vision) is not silent.
+            echo
+            if [ "$BUNDLE" = failure ]; then
+              echo "Agent path: the bundle step failed, so run-one read the bill without the agent."
+            elif [ "$DIGITAL" = true ] && [ "$DISPATCH" != success ]; then
+              echo "Agent path: the dispatch or key step failed, so run-one read this digital bill without the agent."
+            elif [ "$DIGITAL" = true ] && [ "$DELIVERED" != success ]; then
+              echo "Agent path: the agent run sent no result, so run-one read this digital bill without it."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
