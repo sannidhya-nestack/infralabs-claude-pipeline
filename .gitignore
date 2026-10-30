@@ -3,3 +3,7 @@ app/
 *.log
 .env*
 my.cnf
+__pycache__/
+*.pdf
+bill.txt
+out/

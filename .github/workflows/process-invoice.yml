@@ -89,34 +89,70 @@ jobs:
           persist-credentials: false
           path: app
 
-      # Caches the npm download cache only, never node_modules (it holds the
-      # generated Prisma client of the private schema).
+      # No npm download cache: it bought nothing (npm ci took 27-29 s with it, 21-31 s without).
+      # The time is unpacking and prisma generate, so node_modules itself is cached, below.
       - name: Set up Node
         if: steps.check.outputs.runnable == 'true'
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
-          cache: npm
-          cache-dependency-path: app/package-lock.json
 
-      - name: Install dependencies
-        if: steps.check.outputs.runnable == 'true'
-        working-directory: app
-        run: npm ci --no-audit --no-fund > "$RUNNER_TEMP/npm-ci.log" 2>&1 || { tail -n 30 "$RUNNER_TEMP/npm-ci.log"; exit 1; }
-
-      # pdfjs crashes inside canvas without fonts (same as the worker image).
-      - name: Install fonts
-        if: steps.check.outputs.runnable == 'true'
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends fonts-dejavu-core fontconfig
-
-      - name: Install Claude Code CLI
+      # node_modules comes from the Actions cache only when its sha256 matches the pointer in our
+      # S3 bucket. Other runs in this repo (agent runs included) can write a cache entry under any
+      # key, but none of them holds an AWS key: a forged entry fails the check and npm ci runs.
+      - name: Dependency cache pointer
+        id: deps
         if: steps.check.outputs.runnable == 'true'
         env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ vars.AWS_REGION || 'ap-southeast-2' }}
+          AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
+          LOCK_HASH: ${{ hashFiles('app/package-lock.json') }}
+        run: |
+          pointer="runner-cache/node-modules/$GITHUB_REF_NAME-node22-$LOCK_HASH.sha256"
+          sha=$(aws s3 cp "s3://$AWS_S3_BUCKET/$pointer" - 2>/dev/null | head -c 64) || true
+          [[ "$sha" =~ ^[0-9a-f]{64}$ ]] || sha=""
+          echo "pointer=$pointer" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Restore node_modules
+        if: steps.deps.outputs.sha != ''
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/nm.tar
+          key: nm-v1-${{ hashFiles('app/package-lock.json') }}-${{ steps.deps.outputs.sha }}
+
+      # Fonts and the Claude CLI install while npm runs. pdfjs crashes inside canvas without
+      # fonts (same as the worker image).
+      - name: Install dependencies
+        id: install
+        if: steps.check.outputs.runnable == 'true'
+        working-directory: app
+        env:
+          SHA: ${{ steps.deps.outputs.sha }}
           CLAUDE_CLI_VERSION: ${{ vars.CLAUDE_CLI_VERSION }}
         run: |
           version="${CLAUDE_CLI_VERSION:-2.1.295}"
           [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::CLAUDE_CLI_VERSION must be an exact version such as 2.1.295"; exit 1; }
-          npm install -g --no-audit --no-fund "@anthropic-ai/claude-code@$version"
+          { fc-list 2>/dev/null | grep -qi dejavu || { sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends fonts-dejavu-core fontconfig; }; } > "$RUNNER_TEMP/fonts.log" 2>&1 &
+          fonts=$!
+          npm install -g --no-audit --no-fund "@anthropic-ai/claude-code@$version" > "$RUNNER_TEMP/cli.log" 2>&1 &
+          cli=$!
+          tarball="$RUNNER_TEMP/nm.tar"
+          if [ -n "$SHA" ] && [ -f "$tarball" ] && echo "$SHA  $tarball" | sha256sum -c --status; then
+            tar -xf "$tarball"
+            # The generated Prisma client is never cached (private schema): postinstall builds it.
+            npm run postinstall --if-present > "$RUNNER_TEMP/npm-ci.log" 2>&1 || { tail -n 30 "$RUNNER_TEMP/npm-ci.log"; exit 1; }
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+          else
+            [ ! -f "$tarball" ] || echo "::warning::Cached node_modules failed its checksum: installing from npm."
+            npm ci --no-audit --no-fund > "$RUNNER_TEMP/npm-ci.log" 2>&1 || { tail -n 30 "$RUNNER_TEMP/npm-ci.log"; exit 1; }
+            echo "hit=false" >> "$GITHUB_OUTPUT"
+          fi
+          rm -f "$tarball"
+          wait "$fonts" || { tail -n 20 "$RUNNER_TEMP/fonts.log"; exit 1; }
+          wait "$cli" || { tail -n 20 "$RUNNER_TEMP/cli.log"; exit 1; }
           claude --version
 
       - name: Process invoice
@@ -235,6 +271,39 @@ jobs:
           else
             echo "Nothing to clean up."
           fi
+
+      # After the bill, so a cache miss never delays it. A nonce makes every save a new sha, so a
+      # key taken by a forged entry is never needed again.
+      # ponytail: the whole node_modules; drop @next/swc-* from the tar if the restore ever shows.
+      - name: Pack node_modules
+        id: pack
+        if: ${{ !cancelled() && steps.install.outputs.hit == 'false' }}
+        working-directory: app
+        run: |
+          date +%s%N > node_modules/.cache-nonce
+          tar --exclude='node_modules/.prisma*' --exclude=node_modules/.cache -cf "$RUNNER_TEMP/nm.tar" node_modules
+          echo "sha=$(sha256sum "$RUNNER_TEMP/nm.tar" | cut -c1-64)" >> "$GITHUB_OUTPUT"
+
+      - name: Save node_modules
+        id: save
+        if: ${{ !cancelled() && steps.pack.outcome == 'success' }}
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/nm.tar
+          key: nm-v1-${{ hashFiles('app/package-lock.json') }}-${{ steps.pack.outputs.sha }}
+
+      - name: Publish the cache pointer
+        if: ${{ !cancelled() && steps.save.outcome == 'success' }}
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ vars.AWS_REGION || 'ap-southeast-2' }}
+          AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
+          POINTER: ${{ steps.deps.outputs.pointer }}
+          SHA: ${{ steps.pack.outputs.sha }}
+        run: |
+          printf '%s' "$SHA" | aws s3 cp - "s3://$AWS_S3_BUCKET/$POINTER" --only-show-errors \
+            || echo "::warning::Could not write the cache pointer: the next run installs from npm again."
 
       - name: Result
         if: steps.check.outputs.runnable == 'true'
