@@ -93,7 +93,7 @@ if [ "$open" != 0 ]; then echo "::error::Jail self-test: the agent can reach $op
 # pass those bwrap flags today. If they ever part, test through the CLI itself.
 marker=$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n') err=$(mktemp)
 seen=$({ sudo -u agent -H /usr/bin/env -C /home/agent/work PATH="$bin:/usr/bin:/bin" "JAIL_MARKER=$marker" \
-  bash -c 'env -u JAIL_MARKER timeout -k 5 120 srt "echo jail-probe; cat /proc/[0-9]*/environ"; exit $?' \
+  bash -c 'env -u JAIL_MARKER timeout -k 5 120 srt -c "echo jail-probe; cat /proc/[0-9]*/environ"; exit $?' \
   2> "$err" || true; } | tr '\0' '\n')
 pkill -KILL -u agent || true
 # srt's own errors only: no bill has arrived yet.
