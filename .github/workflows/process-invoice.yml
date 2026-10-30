@@ -148,10 +148,12 @@ jobs:
           NODE_OPTIONS: --max-old-space-size=12288
           RUN_RESULT_FILE: ${{ runner.temp }}/result.json
           CLAUDE_OCR_MODEL: ${{ vars.CLAUDE_OCR_MODEL || 'claude-sonnet-5-5' }}
+          # "on": a digital bill's kept pages from its text layer first, by run-one's own converter; scanned pages go to vision.
+          CLAUDE_LAYER_PAGES: ${{ vars.LAYER_PAGES }}
         run: |
           # A secret that is not set arrives as "". Unset those, so an empty
           # ANTHROPIC_API_KEY cannot shadow the OAuth token.
-          for name in CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY OPENAI_API_KEY LLM_GENERIC_PARSER_ENABLED; do
+          for name in CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY OPENAI_API_KEY LLM_GENERIC_PARSER_ENABLED CLAUDE_LAYER_PAGES; do
             [ -n "${!name:-}" ] || unset "$name"
           done
           # Missing config must not fail a customer's upload: stop before run-one claims it.
