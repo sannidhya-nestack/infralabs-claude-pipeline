@@ -1,0 +1,319 @@
+name: Bill extract
+run-name: bill extract ${{ inputs.upload_id }}
+
+# One run = one uploaded PDF turned into the Tele-Sense workbook by a deterministic parser
+# (scripts/parsers/, skill telecom-bill-extract), with no LLM tokens when the parser reconciles.
+# The workbook lands next to the bill in S3: <bill key without .pdf>.workbook.xlsx.
+#
+# No parser for the format, or a parser that FAILs: Claude writes or fixes one in the repair job,
+# which holds no AWS or database key (it runs code it wrote over a customer's bill), and the
+# propose job opens a draft PR once patch_guard.py passes it. That bill's workbook comes from
+# the next run, after a person merges the PR: numbers never come from unreviewed code.
+#
+# Logs and artifacts of a public repo are public: logs print only statuses and counts, and the
+# bill and the patch travel between jobs encrypted with a key made for this run.
+on:
+  workflow_dispatch:
+    inputs:
+      upload_id:
+        description: Upload id from the platform (Upload.id)
+        required: true
+        type: string
+      parser:
+        description: Parser name (scripts/parsers/<name>_bill_to_xlsx.py); empty detects it from page 1
+        required: false
+        default: ""
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: bill-extract-${{ inputs.upload_id }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+  # A parser's summary line, reduced to a status and numbers before it reaches the public summary.
+  COUNTS: >-
+    def n: if type == "number" then tostring else "-" end;
+    "status \(if .status == "PASS" or .status == "FAIL" then .status else "-" end), pages \(.pages | n),
+    rows \(.rows | n), errors \(.errors | n), duplicate ids \(.duplicate_ids | n),
+    failed checks \(.failed_checks | if type == "array" then (length | tostring) else "-" end)"
+
+jobs:
+  extract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      parser: ${{ steps.detect.outputs.parser }}
+      repair: ${{ steps.handoff.outcome == 'success' }}
+      key: ${{ steps.handoff.outputs.key }}
+    steps:
+      - name: Validate inputs
+        env:
+          UPLOAD_ID_INPUT: ${{ inputs.upload_id }}
+          PARSER_INPUT: ${{ inputs.parser }}
+        run: |
+          [[ "$UPLOAD_ID_INPUT" =~ ^[a-z0-9]{20,40}$ ]] || { echo "::error::upload_id is not a platform upload id"; exit 1; }
+          [[ -z "$PARSER_INPUT" || "$PARSER_INPUT" =~ ^[a-z0-9_]{1,40}$ ]] || { echo "::error::parser must be a name such as optus"; exit 1; }
+          echo "UPLOAD_ID=$UPLOAD_ID_INPUT" >> "$GITHUB_ENV"
+          echo "PARSER_INPUT=$PARSER_INPUT" >> "$GITHUB_ENV"
+
+      - name: Check out parsers
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      # apt and pip at once; apt is most of the wait. pip takes only hash-pinned packages.
+      - name: Install tools
+        run: |
+          (sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends poppler-utils) > "$RUNNER_TEMP/apt.log" 2>&1 &
+          apt=$!
+          pip install -q --require-hashes -r requirements.txt
+          wait "$apt" || { tail -n 20 "$RUNNER_TEMP/apt.log"; exit 1; }
+
+      - name: Fetch bill
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ vars.AWS_REGION || 'ap-southeast-2' }}
+          AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
+        run: |
+          source scripts/db.sh
+          valid_id "$UPLOAD_ID"
+          key=$(db_query "SELECT s3Key FROM Upload WHERE id = '$UPLOAD_ID'")
+          [ -n "$key" ] || { echo "::error::No upload with that id"; exit 1; }
+          # The key holds the customer's file name.
+          echo "::add-mask::$key"
+          [[ "${key,,}" == *.pdf ]] || { echo "::error::Not a PDF"; exit 1; }
+          printf '%s' "$key" > "$RUNNER_TEMP/bill-key"
+          aws s3 cp "s3://$AWS_S3_BUCKET/$key" bill.pdf --only-show-errors
+
+      - name: Detect
+        id: detect
+        run: |
+          read -r kind parser < <(python3 scripts/parsers/detect.py bill.pdf | sed -E 's/^kind=(\S+) parser=(\S+)$/\1 \2/')
+          if [ -n "$PARSER_INPUT" ]; then
+            parser=$PARSER_INPUT
+            [ -f "scripts/parsers/${parser}_bill_to_xlsx.py" ] || { echo "::error::No parser named $parser"; exit 1; }
+          fi
+          echo "kind=$kind" >> "$GITHUB_OUTPUT"
+          echo "parser=$parser" >> "$GITHUB_OUTPUT"
+          echo "### Pages $(pdfinfo bill.pdf | awk '/^Pages:/ {print $2}'), $kind, parser $parser" >> "$GITHUB_STEP_SUMMARY"
+          [ "$kind" = digital ] || echo "::notice::Scanned bill: no parser can read it, the vision path (process-invoice.yml) does."
+
+      - name: Parse and reconcile
+        id: parse
+        if: steps.detect.outputs.kind == 'digital' && steps.detect.outputs.parser != 'none'
+        env:
+          PARSER: ${{ steps.detect.outputs.parser }}
+        run: |
+          mkdir -p out
+          code=0
+          # stdout is status and counts only. stderr can carry bill text in a traceback: it stays here.
+          python3 "scripts/parsers/${PARSER}_bill_to_xlsx.py" bill.pdf out/workbook.xlsx --report out/report.json \
+            > out/summary.json 2> "$RUNNER_TEMP/parse.err" || code=$?
+          case "$code" in 0) status=pass ;; 2) status=fail ;; *) status=crash ;; esac
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          { echo "Parser **$PARSER**: $status"; echo; jq -r "$COUNTS" out/summary.json 2>/dev/null || true; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish workbook
+        if: steps.parse.outputs.status == 'pass'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_REGION: ${{ vars.AWS_REGION || 'ap-southeast-2' }}
+          AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
+        run: |
+          key=$(cat "$RUNNER_TEMP/bill-key")
+          base="${key%.*}"
+          aws s3 cp out/workbook.xlsx "s3://$AWS_S3_BUCKET/$base.workbook.xlsx" --only-show-errors
+          aws s3 cp out/report.json "s3://$AWS_S3_BUCKET/$base.extract-report.json" --only-show-errors
+          echo "Workbook saved next to the bill: <bill>.workbook.xlsx" >> "$GITHUB_STEP_SUMMARY"
+
+      # A random key per run, passed as a job output (GitHub shows those nowhere). Not masked:
+      # GitHub drops an output that holds a masked value.
+      - name: Hand the bill to the repair job
+        id: handoff
+        if: >-
+          steps.detect.outputs.kind == 'digital'
+          && (steps.detect.outputs.parser == 'none' || steps.parse.outputs.status == 'fail' || steps.parse.outputs.status == 'crash')
+        run: |
+          k=$(openssl rand -hex 32)
+          K="$k" openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -in bill.pdf -out "$RUNNER_TEMP/bill.pdf.enc" -pass env:K
+          echo "key=$k" >> "$GITHUB_OUTPUT"
+
+      - name: Upload encrypted bill
+        if: steps.handoff.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bill-enc
+          path: ${{ runner.temp }}/bill.pdf.enc
+          retention-days: 1
+          if-no-files-found: error
+
+  repair:
+    needs: extract
+    if: needs.extract.outputs.repair == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    # No AWS or database key in this job, and a read-only token: Claude runs code it wrote over a
+    # customer's bill, which may carry instructions. The Claude credential is the only secret.
+    permissions:
+      contents: read
+    outputs:
+      patch: ${{ steps.patch.outputs.patch }}
+      parser: ${{ steps.patch.outputs.parser }}
+    steps:
+      - name: Check out parsers
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install tools
+        run: |
+          (sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends poppler-utils) > "$RUNNER_TEMP/apt.log" 2>&1 &
+          apt=$!
+          pip install -q --require-hashes -r requirements.txt
+          pip install -q pytest==8.3.5
+          wait "$apt" || { tail -n 20 "$RUNNER_TEMP/apt.log"; exit 1; }
+
+      - name: Download encrypted bill
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: bill-enc
+          path: ${{ runner.temp }}
+
+      - name: Decrypt bill
+        env:
+          K: ${{ needs.extract.outputs.key }}
+        run: openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in "$RUNNER_TEMP/bill.pdf.enc" -out bill.pdf -pass env:K
+
+      - name: Claude writes or fixes the parser
+        uses: anthropics/claude-code-action@6d5ae526d25ce88daa2200be073e1a373167f064 # v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ github.token }}
+          show_full_output: "false"
+          display_report: "false"
+          prompt: |
+            /telecom-bill-extract
+            Bill: ./bill.pdf (digital). Parser: ${{ needs.extract.outputs.parser }}.
+            If the parser is "none", no parser knows this format: write one. Otherwise that parser
+            FAILed reconciliation on this bill: fix it. Diagnose with grep/sed on page slices, never
+            cat the full text. Add a synthetic test, run the parser and pytest until both pass.
+            Leave the changes uncommitted. This repo is public: no name, number or line from the
+            bill in any file or in your final message.
+          claude_args: |
+            --max-turns 80
+            --allowedTools "Read,Edit,Write,Glob,Grep,Bash(python3:*),Bash(python:*),Bash(pytest:*),Bash(pdftotext:*),Bash(pdfinfo:*),Bash(pdffonts:*),Bash(grep:*),Bash(sed:*),Bash(head:*),Bash(wc:*),Bash(mkdir:*),Bash(git diff:*),Bash(git status:*)"
+            --disallowedTools "WebFetch,WebSearch"
+
+      # Only a parser that passes and a test suite that passes become a patch. The guard that
+      # decides whether it may go public runs in the propose job, not here.
+      - name: Check the fix
+        id: patch
+        env:
+          PARSER_IN: ${{ needs.extract.outputs.parser }}
+          K: ${{ needs.extract.outputs.key }}
+        run: |
+          parser=$PARSER_IN
+          if [ "$parser" = none ]; then
+            parser=$(python3 scripts/parsers/detect.py bill.pdf | sed -E 's/^.* parser=(\S+)$/\1/')
+          fi
+          if [ "$parser" = none ] || [ ! -f "scripts/parsers/${parser}_bill_to_xlsx.py" ]; then
+            echo "::warning::No parser reads this bill yet: a person has to look at it."
+            exit 0
+          fi
+          mkdir -p out
+          code=0
+          python3 "scripts/parsers/${parser}_bill_to_xlsx.py" bill.pdf out/workbook.xlsx --report out/report.json \
+            > out/summary.json 2>/dev/null || code=$?
+          { echo "After Claude, parser **$parser**: exit $code"; echo; jq -r "$COUNTS" out/summary.json 2>/dev/null || true; } >> "$GITHUB_STEP_SUMMARY"
+          [ "$code" = 0 ] || { echo "::warning::Still not PASS: a person has to look at this bill."; exit 0; }
+          python3 -m pytest -q -p no:cacheprovider tests > "$RUNNER_TEMP/pytest.log" 2>&1 \
+            || { echo "::warning::Tests fail: $(tail -n 1 "$RUNNER_TEMP/pytest.log" | tr -cd 'A-Za-z0-9 ,.=')"; exit 0; }
+          git add -N scripts/parsers tests .claude/skills/telecom-bill-extract/carriers
+          git diff -- scripts/parsers tests .claude/skills/telecom-bill-extract/carriers > "$RUNNER_TEMP/parser.patch"
+          [ -s "$RUNNER_TEMP/parser.patch" ] || { echo "::warning::Claude changed nothing."; exit 0; }
+          K="$K" openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -in "$RUNNER_TEMP/parser.patch" -out "$RUNNER_TEMP/parser.patch.enc" -pass env:K
+          echo "patch=true" >> "$GITHUB_OUTPUT"
+          echo "parser=$parser" >> "$GITHUB_OUTPUT"
+
+      - name: Upload encrypted patch
+        if: steps.patch.outputs.patch == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: patch-enc
+          path: ${{ runner.temp }}/parser.patch.enc
+          retention-days: 1
+          if-no-files-found: error
+
+  propose:
+    needs: [extract, repair]
+    if: needs.repair.outputs.patch == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # A fresh checkout: nothing the repair job touched runs here. No AWS, database or Claude key.
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Check out
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install poppler
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends poppler-utils > /dev/null
+
+      - name: Download encrypted bill and patch
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: "*-enc"
+          merge-multiple: true
+          path: ${{ runner.temp }}
+
+      - name: Guard the patch
+        env:
+          K: ${{ needs.extract.outputs.key }}
+        run: |
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in "$RUNNER_TEMP/bill.pdf.enc" -out "$RUNNER_TEMP/bill.pdf" -pass env:K
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in "$RUNNER_TEMP/parser.patch.enc" -out "$RUNNER_TEMP/parser.patch" -pass env:K
+          python3 scripts/patch_guard.py "$RUNNER_TEMP/parser.patch" "$RUNNER_TEMP/bill.pdf" \
+            || { echo "::error::The patch was not published (counts above). Re-run, or fix the parser by hand."; exit 1; }
+          rm -f "$RUNNER_TEMP/bill.pdf"
+
+      - name: Open a draft PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PARSER: ${{ needs.repair.outputs.parser }}
+        run: |
+          [[ "$PARSER" =~ ^[a-z0-9_]{1,40}$ ]] || { echo "::error::Bad parser name"; exit 1; }
+          branch="fix/parser-$PARSER-$GITHUB_RUN_ID"
+          git switch -c "$branch"
+          git apply --index "$RUNNER_TEMP/parser.patch"
+          git -c user.name="github-actions[bot]" -c user.email="41898233+github-actions[bot]@users.noreply.github.com" \
+            commit -q -m "fix(parser): $PARSER reconciles (bill-extract run $GITHUB_RUN_ID)"
+          git push -q origin "$branch"
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          gh pr create --draft --base "$GITHUB_REF_NAME" --head "$branch" \
+            --title "fix(parser): $PARSER" \
+            --body "Written by Claude in bill-extract run $run_url: the parser now reconciles that bill (PASS) and the tests pass. Review the parser like any code, merge, then run bill-extract again for that upload to publish its workbook." \
+            || echo "::warning::Branch $branch pushed, but the PR could not be opened (allow Actions to create PRs in Settings > Actions > General)."
